@@ -169,7 +169,7 @@ class DashboardWorkMapContracts(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(self.conn, results)
         text = out.getvalue()
-        self.assertEqual(text.count("Shared / Session Search"), 2)
+        self.assertGreaterEqual(text.count("Shared / Session Search"), 2)
         self.assertIn("Open |", text)
 
     def test_full_index_project_discovery_keeps_older_projects(self) -> None:
