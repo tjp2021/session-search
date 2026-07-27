@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "canonical_repository": "https://github.com/tjp2021/session-search",
+  "contracts": [
+    {
+      "id": "dashboard-limit-is-exact",
+      "test": "tests.test_behavior_contracts.DashboardBehaviorContracts.test_explicit_limit_is_passed_through_exactly"
+    },
+    {
+      "id": "dashboard-keeps-actionable-state",
+      "test": "tests.test_behavior_contracts.DashboardBehaviorContracts.test_dashboard_keeps_about_state_and_resume"
+    },
+    {
+      "id": "public-source-is-private-data-free",
+      "command": ["python3", "scripts/check_public_privacy.py"]
+    }
+  ]
+}

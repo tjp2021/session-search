@@ -1,4 +1,5 @@
 .coveragerc
+.cos/contracts.json
 .github/workflows/ci.yml
 .gitignore
 LICENSE
@@ -39,6 +40,7 @@ tests/test_archive_intent.py
 tests/test_fault_reliability.py
 tests/test_natural_parser.py
 tests/test_productization.py
+tests/test_behavior_contracts.py
 tests/test_public_card_quality.py
 tests/test_retrieval_metrics.py
 uv.lock
