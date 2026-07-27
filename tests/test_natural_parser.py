@@ -1130,7 +1130,9 @@ class OutputShapeTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(conn, results)
         text = out.getvalue()
-        self.assertIn("Active Claude Code + Codex dashboard", text)
+        self.assertIn("SS WORK MAP", text)
+        self.assertIn("PROJECTS", text)
+        self.assertIn("THREADS", text)
         self.assertIn("1. [Claude Code]", text)
         self.assertIn("2. [Codex]", text)
         self.assertIn("About: Claude planning work", text)
@@ -1234,7 +1236,7 @@ class OutputShapeTest(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(conn, archived, archived_view=True)
-        self.assertIn("Archived Claude Code + Codex sessions", out.getvalue())
+        self.assertIn("Archived sessions", out.getvalue())
         self.assertIn("[ARCHIVED]", out.getvalue())
         conn.close()
 

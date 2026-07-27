@@ -28,12 +28,14 @@ class DashboardBehaviorContracts(unittest.TestCase):
                 mock.patch.object(ss, "connect_db", return_value=connection),
                 mock.patch.object(ss, "init_db"),
                 mock.patch.object(ss, "recent_session_results", return_value=[]) as recent,
+                mock.patch.object(ss, "dashboard_project_summaries", return_value=[]) as projects,
                 mock.patch.object(ss, "save_last_results"),
                 mock.patch.object(ss, "print_dashboard"),
                 mock.patch.object(ss, "dashboard_prompt", return_value=0),
             ):
                 self.assertEqual(ss.cmd_dashboard(args), 0)
             recent.assert_called_once_with(connection, 3, None)
+            projects.assert_called_once()
 
     def test_dashboard_keeps_about_state_and_resume(self):
         source = pathlib.Path(ss.__file__).read_text(encoding="utf-8")
@@ -43,6 +45,7 @@ class DashboardBehaviorContracts(unittest.TestCase):
         self.assertIn('print(f"   About: {about}")', dashboard)
         self.assertIn('print(f"   State: {state}")', dashboard)
         self.assertIn('print(f"   Resume: {resume}")', dashboard)
+        self.assertIn('SS WORK MAP', dashboard)
 
 
 if __name__ == "__main__":
