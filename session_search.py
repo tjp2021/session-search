@@ -56,7 +56,7 @@ DEFAULT_MODEL_CACHE = str(_DEFAULT_PATHS.model_cache)
 DEFAULT_EVALS = pathlib.Path(__file__).resolve().with_name("evals") / "session-search-evals.json"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_MODEL_VERSION = "fastembed:" + EMBED_MODEL
-CARD_VERSION = "local-card-v9"
+CARD_VERSION = "local-card-v10"
 EMBED_TEXT_CHARS = 5000
 MAX_DOC_CHARS = 16000
 CHUNK_OVERLAP = 800
@@ -2273,6 +2273,19 @@ def full_user_message_text(row: sqlite3.Row) -> str:
         return ""
     if INJECTED_USER_MESSAGE_RE.match(text):
         return ""
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if re.match(r"^(?:[\w.-]+@[\w.-]+|\$\s|#\s)", first):
+        return ""
+    if "% ss" in first.lower() or ("@" in first and re.search(r"\bss\b", first)):
+        return ""
+    if re.fullmatch(r"(?:stop|ok|okay|yes|no|thanks|continue|sure|cool|great|wait)\.?", first, flags=re.I):
+        return ""
+    if first.startswith(("<command-", "<local-command", "Open a number, type search words")):
+        return ""
+    if first.startswith(">") and len(first) < 80:
+        return ""
+    if first.lower().startswith(("exit codex", "exit claude")):
+        return ""
     return text
 
 
@@ -2296,7 +2309,7 @@ def last_user_message(rows: list[sqlite3.Row], fallback: sqlite3.Row) -> str:
 def recent_user_messages(
     rows: list[sqlite3.Row],
     fallback: sqlite3.Row,
-    limit: int = 3,
+    limit: int = 6,
 ) -> list[str]:
     messages: list[str] = []
     seen: set[str] = set()
@@ -2671,40 +2684,159 @@ def dashboard_key_terms(text: str, limit: int = 4) -> list[str]:
     return terms
 
 
+def _card_field_ready(value: str) -> str:
+    return re.sub(r"(?:\.{3}|…)+\s*$", "", value or "").strip()
+
+
+def _dedupe_card_path(path: str) -> str:
+    path = sanitize_text(path)
+    if not path:
+        return ""
+    if len(path) % 2 == 0:
+        half = len(path) // 2
+        if path[:half] == path[half:]:
+            return path[:half]
+    for token in ("/tmp/", "/Users/", "/home/"):
+        idx = path.find(token, 1)
+        if idx <= 0:
+            continue
+        left = path[:idx].rstrip("/")
+        right = path[idx:]
+        if left.split("/")[-1] and left.split("/")[-1] == right.rstrip("/").split("/")[-1]:
+            return right
+    return path
+
+
+def _short_topic(text: str) -> str:
+    clean = re.sub(r"\s+", " ", sanitize_text(text)).strip()
+    if not clean:
+        return ""
+    if ":" in clean:
+        head = clean.split(":", 1)[0].strip()
+        if 1 <= len(head.split()) <= 8:
+            return head
+    parts = re.split(r"(?<=[.!?])\s+", clean)
+    return parts[0].strip() if parts else clean
+
+
+def _strip_card_prefixes(text: str) -> str:
+    return re.sub(
+        r"^\s*(?:what\s+happened|state|resume|about|next(?:\s+clue)?)\s*:\s*",
+        "",
+        text or "",
+        flags=re.I,
+    ).strip()
+
+
+def dashboard_pick_about(messages: list[str], card: SessionCard) -> str:
+    bare_title = re.sub(
+        r"^\d{2}/\d{2}/\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+[—-]\s+",
+        "",
+        card.title or "",
+    )
+    for candidate in (dashboard_topic(card), _short_topic(bare_title), bare_title):
+        line = clean_card_line(candidate or "", 120)
+        if line and line.lower() not in {"untitled session", "untitled session."}:
+            return line
+    ranked: list[tuple[float, str]] = []
+    for message in messages:
+        line = clean_card_line(_short_topic(message), 140)
+        if not line or len(line) > 140:
+            continue
+        ranked.append((line_quality_score(line) + min(len(line), 80) / 80.0, line))
+    if ranked:
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked[0][1]
+    project = dashboard_project_label(card.repo or "")
+    tool = source_label(card.source)
+    if project and project not in {"Unknown folder", "OS root"}:
+        return f"{tool} work in {project}."
+    return f"{tool} session."
+
+
+def dashboard_pick_state(rows: list[sqlite3.Row], about: str, card: SessionCard) -> str:
+    blocked = re.sub(r"\W+", "", about or "").lower()
+    for row in sorted(rows or [], key=row_sort_key):
+        if str(row_field(row, "role", "")).lower() not in {"assistant", "system"}:
+            continue
+        for line in meaningful_lines(str(row_field(row, "text", ""))):
+            if is_question_like(line):
+                continue
+            if not (STATE_SENTENCE_RE.search(line) or ACTION_WORD_RE.search(line) or REPORTED_CHANGE_RE.search(line)):
+                continue
+            cleaned = clean_card_line(_strip_card_prefixes(line), 160)
+            if not cleaned or cleaned.startswith(("|", "```", "#")):
+                continue
+            if re.sub(r"\W+", "", cleaned).lower() == blocked:
+                continue
+            return cleaned
+    for candidate in (card.what_happened, card.what_this_was):
+        cleaned = clean_card_line(_strip_card_prefixes(candidate or ""), 160)
+        if cleaned and not cleaned.startswith(("|", "```", "#")) and re.sub(r"\W+", "", cleaned).lower() != blocked:
+            return cleaned
+    return ""
+
+
+def dashboard_pick_resume(
+    messages: list[str],
+    rows: list[sqlite3.Row],
+    about: str,
+    state: str,
+    card: SessionCard,
+) -> str:
+    blocked = {re.sub(r"\W+", "", about or "").lower(), re.sub(r"\W+", "", state or "").lower()}
+    intent = re.compile(
+        r"\b(?:need(?:ed|s)?\s+to|should|please|fix|implement|resume|continue|find|open|next|still|unfinished|before|let'?s)\b",
+        re.I,
+    )
+    for message in messages:
+        for sentence in dashboard_sentences(message):
+            if not (RESUME_SENTENCE_RE.search(sentence) or intent.search(sentence)):
+                continue
+            cleaned = clean_card_line(_strip_card_prefixes(sentence), 160)
+            if not cleaned or cleaned.lower().startswith("stop") or cleaned.startswith(("|", "```", "#", ">")):
+                continue
+            if re.sub(r"\W+", "", cleaned).lower() in blocked:
+                continue
+            return cleaned
+    for row in sorted(rows or [], key=row_sort_key, reverse=True):
+        if str(row_field(row, "role", "")).lower() not in {"assistant", "user"}:
+            continue
+        for line in meaningful_lines(str(row_field(row, "text", ""))):
+            if not (RESUME_SENTENCE_RE.search(line) or NEXT_WORD_RE.search(line) or intent.search(line)):
+                continue
+            cleaned = clean_card_line(_strip_card_prefixes(line), 160)
+            if not cleaned or cleaned.startswith(("|", "```", "#", ">")):
+                continue
+            if re.sub(r"\W+", "", cleaned).lower() in blocked:
+                continue
+            return cleaned
+    cleaned = clean_card_line(_strip_card_prefixes(card.next_clue or ""), 160)
+    if cleaned and re.sub(r"\W+", "", cleaned).lower() not in blocked and not cleaned.startswith(("|", "```", "#", ">")):
+        return cleaned
+    return ""
+
+
 def dashboard_summary(
     card: SessionCard,
     rows: list[sqlite3.Row],
     fallback: sqlite3.Row,
 ) -> tuple[str, str, str, str]:
-    requests = recent_user_messages(rows, fallback, limit=3)
-    latest = requests[0] if requests else card.last_user_message
-    latest_sentences = dashboard_sentences(latest)
-
-    state = next((sentence for sentence in latest_sentences if STATE_SENTENCE_RE.search(sentence)), "")
-    if not state:
-        state = card.what_happened or card.what_this_was
-
-    resume = next((sentence for sentence in latest_sentences if RESUME_SENTENCE_RE.search(sentence)), "")
-    if not resume:
-        resume = card.next_clue or latest
-    resume = re.sub(r"\s+i\s+want\s+this\s+one\.?$", ".", resume, flags=re.I)
-
+    requests = recent_user_messages(rows, fallback, limit=6)
+    about_raw = dashboard_pick_about(requests, card)
+    state_raw = dashboard_pick_state(rows, about_raw, card)
+    resume_raw = dashboard_pick_resume(requests, rows, about_raw, state_raw, card)
     clue = ""
     if card.mentioned_paths:
-        clue = f"Mentioned path: {card.mentioned_paths[0]}"
-    else:
-        terms = dashboard_key_terms(" ".join((dashboard_topic(card), latest, state, resume)))
-        if terms:
-            clue = "Key terms: " + " · ".join(terms)
-        elif card.repo:
-            clue = f"Work folder: {card.repo}"
-
-    fields = quality_gate(dashboard_topic(card), state, resume)
+        path = _dedupe_card_path(card.mentioned_paths[0])
+        if path and "history.jsonl" not in path.lower():
+            clue = f"Path: {path}"
+    fields = quality_gate(_card_field_ready(about_raw), _card_field_ready(state_raw), _card_field_ready(resume_raw))
     return (
-        compact(fields.about, 180),
-        compact(fields.state, 240),
-        compact(fields.resume, 260),
-        compact(clue, 200),
+        compact(fields.about, 140),
+        compact(fields.state, 160),
+        compact(fields.resume, 160),
+        compact(clue, 120),
     )
 
 
@@ -2768,6 +2900,17 @@ def normalize_card_typos(text: str) -> str:
         r"\bknkow\b": "know",
         r"\bworkihg\b": "working",
         r"\bapopintment\b": "appointment",
+        r"\bapplciation\b": "application",
+        r"\bssession\b": "session",
+        r"\bstqate\b": "state",
+        r"\bworkign\b": "working",
+        r"\bwereew\b": "were",
+        r"\borkign\b": "working",
+        r"\bfoudnit\b": "found it",
+        r"\besle\b": "else",
+        r"\beveyrthing\b": "everything",
+        r"\btaht\b": "that",
+        r"\bcotnext\b": "context",
     }
     for pattern, replacement in replacements.items():
         text = re.sub(pattern, replacement, text, flags=re.I)
@@ -2787,7 +2930,13 @@ def extract_task_clause(text: str) -> str:
 
 def strip_card_filler(text: str) -> str:
     text = re.sub(r"^\[Image #\d+\]\s*", "", text)
-    text = re.sub(r"^(?:ok|okay|yea|yeah|honestly|dude|bro|first honest to god)[,.\s]+", "", text, flags=re.I)
+    text = re.sub(
+        r"^(?:ok|okay|yea|yeah|honestly|dude|bro|first honest to god|what happened|state|resume|about|next)\s*[:\-–—]?\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"^›\s*", "", text)
     return text.strip()
 
 
@@ -2798,6 +2947,11 @@ def clean_card_line(text: str, limit: int = 220) -> str:
     text = strip_card_filler(text)
     text = normalize_card_typos(text)
     text = re.sub(r"\s+", " ", text).strip()
+    if text.startswith(("|", "```", "# ")):
+        return ""
+    first = text.split(" ", 1)[0] if text else ""
+    if re.match(r"^(?:[\w.-]+@[\w.-]+)$", first):
+        return ""
     return compact(text, limit)
 
 

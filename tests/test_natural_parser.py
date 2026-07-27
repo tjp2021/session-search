@@ -1133,7 +1133,7 @@ class OutputShapeTest(unittest.TestCase):
         self.assertIn("SS", text)
         self.assertIn("1. Claude", text)
         self.assertIn("2. Codex", text)
-        self.assertIn("About: Claude planning work", text)
+        self.assertIn("About: Claude planning work.", text)
         self.assertIn(
             "State: No clear completed work found in local evidence.", text
         )
@@ -1406,7 +1406,7 @@ class OutputShapeTest(unittest.TestCase):
             resume,
             "The x402 pilot still needed its first complete lesson/card/grade cycle before bulk agentic-commerce import.",
         )
-        self.assertEqual(clue, "Key terms: Osmo · x402 · curriculum-import · architecture")
+        self.assertEqual(clue, "")  # no key-terms soup; path-only clues
 
     def test_dashboard_prompt_opens_selected_session(self):
         args = ss.argparse.Namespace(db=":memory:", limit=10, source="all", mode="hybrid")
