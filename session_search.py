@@ -3785,12 +3785,25 @@ def dashboard_terminal_width() -> int:
 
 
 def dashboard_clean_text(value: str) -> str:
-    """Strip control junk that makes terminal paste unreadable."""
-    clean = sanitize_text(value)
-    clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", " ", clean)
+    """Strip control junk that makes terminal paste unreadable.
+
+    Do not use sanitize_text() here: it line-strips and would destroy the
+    intentional left indentation of dashboard rows.
+    """
+    if value is None:
+        clean = ""
+    elif isinstance(value, str):
+        clean = value
+    else:
+        clean = str(value)
+    clean = re.sub(r"\[[0-9;?]*[A-Za-z]", " ", clean)
     clean = re.sub(r"\[[0-9;]{1,12}[A-Za-z]", " ", clean)
     clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", clean)
-    return re.sub(r"\s+", " ", clean).strip()
+    leading = len(clean) - len(clean.lstrip(" "))
+    core = re.sub(r"\s+", " ", clean.strip())
+    if not core:
+        return ""
+    return (" " * min(leading, 8)) + core
 
 
 def dashboard_cell(value: str, width: int) -> str:
