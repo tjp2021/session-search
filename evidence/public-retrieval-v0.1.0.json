@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "corpus": {
+    "sessions": 120,
+    "queries": 80
+  },
+  "modes": {
+    "fts": {
+      "top_one": 0.6,
+      "recall_at_five": 0.6125,
+      "mrr_at_ten": 0.60625,
+      "categories": {
+        "exact": {"top_one": 1.0, "recall_at_five": 1.0, "mrr_at_ten": 1.0},
+        "fuzzy": {"top_one": 0.15, "recall_at_five": 0.15, "mrr_at_ten": 0.15},
+        "semantic": {"top_one": 0.35, "recall_at_five": 0.35, "mrr_at_ten": 0.35},
+        "time": {"top_one": 0.9, "recall_at_five": 0.95, "mrr_at_ten": 0.925}
+      }
+    },
+    "local": {
+      "top_one": 0.6875,
+      "recall_at_five": 0.7,
+      "mrr_at_ten": 0.69375,
+      "categories": {
+        "exact": {"top_one": 1.0, "recall_at_five": 1.0, "mrr_at_ten": 1.0},
+        "fuzzy": {"top_one": 0.4, "recall_at_five": 0.4, "mrr_at_ten": 0.4},
+        "semantic": {"top_one": 0.45, "recall_at_five": 0.45, "mrr_at_ten": 0.45},
+        "time": {"top_one": 0.9, "recall_at_five": 0.95, "mrr_at_ten": 0.925}
+      }
+    },
+    "hybrid": {
+      "top_one": 0.9,
+      "recall_at_five": 0.95,
+      "mrr_at_ten": 0.91875,
+      "categories": {
+        "exact": {"top_one": 1.0, "recall_at_five": 1.0, "mrr_at_ten": 1.0},
+        "fuzzy": {"top_one": 0.95, "recall_at_five": 0.95, "mrr_at_ten": 0.95},
+        "semantic": {"top_one": 0.65, "recall_at_five": 0.85, "mrr_at_ten": 0.725},
+        "time": {"top_one": 1.0, "recall_at_five": 1.0, "mrr_at_ten": 1.0}
+      }
+    }
+  }
+}

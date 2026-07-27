@@ -1,0 +1,333 @@
+import json
+import errno
+import contextlib
+import io
+import pathlib
+import multiprocessing
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+import archive_intent
+import archive_store
+import platform_lock
+import schema_migrations
+import session_search as ss
+
+
+def crash_writer(path: str, phase: str) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("INSERT INTO status VALUES('archived')")
+    if phase == "status":
+        os._exit(91)
+    conn.execute("INSERT INTO events VALUES('close')")
+    if phase == "event":
+        os._exit(92)
+    conn.commit()
+
+
+def hold_file_lock(path: str, ready, release) -> None:
+    with platform_lock.file_lock(pathlib.Path(path), timeout=2):
+        ready.set()
+        release.wait(5)
+
+
+class TransactionFaultTest(unittest.TestCase):
+    def test_real_process_crashes_leave_no_partial_transaction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "crash.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE status(value TEXT)")
+            conn.execute("CREATE TABLE events(value TEXT)")
+            conn.commit()
+            conn.close()
+            context = multiprocessing.get_context("spawn")
+            for phase in ("status", "event"):
+                process = context.Process(target=crash_writer, args=(str(path), phase))
+                process.start()
+                process.join(10)
+                self.assertIn(process.exitcode, {91, 92})
+                check = sqlite3.connect(path)
+                self.assertEqual(check.execute("SELECT COUNT(*) FROM status").fetchone()[0], 0)
+                self.assertEqual(check.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+                self.assertEqual(check.execute("PRAGMA quick_check").fetchone()[0], "ok")
+                check.close()
+
+    def test_actual_sqlite_full_rolls_back(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE payload(value BLOB)")
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+        conn.execute(f"PRAGMA max_page_count = {pages + 1}")
+        with self.assertRaises(sqlite3.OperationalError):
+            with archive_store.immediate_transaction(conn):
+                conn.execute("INSERT INTO payload VALUES(randomblob(1000000))")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM payload").fetchone()[0], 0)
+        conn.close()
+
+    def test_read_only_database_rejects_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "readonly.sqlite"
+            writable = sqlite3.connect(path)
+            writable.execute("CREATE TABLE proof(value TEXT)")
+            writable.close()
+            readonly = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            with self.assertRaises(sqlite3.OperationalError):
+                with archive_store.immediate_transaction(readonly):
+                    readonly.execute("INSERT INTO proof VALUES('no')")
+            readonly.close()
+    def test_nested_failure_preserves_outer_transaction(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE proof(value TEXT)")
+        conn.execute("BEGIN")
+        conn.execute("INSERT INTO proof VALUES('outer')")
+        with self.assertRaises(RuntimeError):
+            with archive_store.immediate_transaction(conn):
+                conn.execute("INSERT INTO proof VALUES('inner')")
+                raise RuntimeError("inner failure")
+        self.assertTrue(conn.in_transaction)
+        self.assertEqual(conn.execute("SELECT value FROM proof").fetchall(), [("outer",)])
+        conn.rollback()
+        conn.close()
+
+    def test_nested_success_obeys_outer_rollback(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE proof(value TEXT)")
+        conn.execute("BEGIN")
+        with archive_store.immediate_transaction(conn):
+            conn.execute("INSERT INTO proof VALUES('inner')")
+        self.assertTrue(conn.in_transaction)
+        conn.rollback()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM proof").fetchone()[0], 0)
+        conn.close()
+
+    def test_successful_transaction_commits(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE proof(value TEXT)")
+        with archive_store.immediate_transaction(conn):
+            conn.execute("INSERT INTO proof VALUES('committed')")
+        self.assertEqual(conn.execute("SELECT value FROM proof").fetchone()[0], "committed")
+        archive_store.quick_check(conn)
+        conn.close()
+
+    def test_failure_between_status_and_event_rolls_back(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE status(value TEXT)")
+        conn.execute("CREATE TABLE events(value TEXT)")
+        with self.assertRaises(RuntimeError):
+            with archive_store.immediate_transaction(conn):
+                conn.execute("INSERT INTO status VALUES('archived')")
+                raise RuntimeError("injected event failure")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM status").fetchone()[0], 0)
+        conn.close()
+
+    def test_integrity_failure_is_typed(self):
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = ("corrupt",)
+        with self.assertRaises(archive_store.StorageFailure):
+            archive_store.quick_check(conn)
+
+    def test_backup_restores_and_retains_five(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            database = root / "source.sqlite"
+            conn = sqlite3.connect(database)
+            conn.execute("CREATE TABLE proof(value TEXT)")
+            conn.execute("INSERT INTO proof VALUES('intact')")
+            conn.commit()
+            latest = None
+            for _ in range(7):
+                latest = archive_store.backup_database(conn, root / "backups")
+            conn.close()
+            self.assertEqual(len(list((root / "backups").glob("session-search-*.sqlite"))), 5)
+            restored = sqlite3.connect(latest)
+            self.assertEqual(restored.execute("SELECT value FROM proof").fetchone()[0], "intact")
+            restored.close()
+
+    def test_backup_failure_removes_temporary_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            conn = mock.Mock()
+            conn.backup.side_effect = sqlite3.OperationalError("full")
+            with self.assertRaises(sqlite3.OperationalError):
+                archive_store.backup_database(conn, pathlib.Path(temp))
+            self.assertEqual(list(pathlib.Path(temp).glob(".session-search-*")), [])
+
+
+class MigrationFaultTest(unittest.TestCase):
+    def test_incomplete_statement_is_rejected(self):
+        conn = sqlite3.connect(":memory:")
+        with self.assertRaises(schema_migrations.MigrationFailure):
+            schema_migrations.execute_statements(conn, "CREATE TABLE unfinished(")
+        conn.close()
+
+    def test_current_schema_is_fully_validated(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ss.init_db(conn)
+        schema_migrations.validate_current_schema(conn)
+        conn.execute("DROP TABLE session_archive_events")
+        with self.assertRaises(schema_migrations.MigrationFailure):
+            schema_migrations.validate_current_schema(conn)
+        conn.close()
+
+    def test_non_fts_documents_table_is_rejected(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ss.init_db(conn)
+        conn.execute("DROP TABLE documents_fts")
+        conn.execute("CREATE TABLE documents_fts(value TEXT)")
+        with self.assertRaises(schema_migrations.MigrationFailure):
+            schema_migrations.validate_schema(conn)
+        conn.close()
+
+    def test_partial_migration_rolls_back_and_retries(self):
+        conn = sqlite3.connect(":memory:")
+        bad = "CREATE TABLE first(value TEXT);\nCREATE INDEX broken ON missing(value);"
+        with self.assertRaises(sqlite3.OperationalError):
+            with archive_store.immediate_transaction(conn):
+                schema_migrations.execute_statements(conn, bad)
+        self.assertIsNone(
+            conn.execute("SELECT name FROM sqlite_master WHERE name='first'").fetchone()
+        )
+        with archive_store.immediate_transaction(conn):
+            schema_migrations.execute_statements(conn, "CREATE TABLE first(value TEXT);")
+        self.assertIsNotNone(
+            conn.execute("SELECT name FROM sqlite_master WHERE name='first'").fetchone()
+        )
+        conn.close()
+
+    def test_incomplete_legacy_schema_is_not_stamped(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE session_archive_status(source TEXT)")
+        with self.assertRaises(schema_migrations.MigrationFailure):
+            schema_migrations.preflight_schema(conn)
+        self.assertEqual(schema_migrations.schema_version(conn), 0)
+        conn.close()
+
+    def test_newer_schema_fails_closed(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA user_version = 99")
+        with self.assertRaises(schema_migrations.MigrationFailure):
+            schema_migrations.preflight_schema(conn)
+        conn.close()
+
+    def test_fake_current_schema_is_rejected(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(f"PRAGMA user_version = {schema_migrations.CURRENT_SCHEMA_VERSION}")
+        with self.assertRaises(schema_migrations.MigrationFailure):
+            schema_migrations.validate_current_schema(conn)
+        conn.close()
+
+
+class HostileIntentTest(unittest.TestCase):
+    def test_controls_and_oversized_prompts_fail_closed(self):
+        cases = (
+            "Close\u200b this session.",
+            "\u202eClose this session.",
+            "Close this session.\x00",
+            ("background " * 7000) + "Close this session.",
+            "`close this session",
+        )
+        for text in cases:
+            with self.subTest(text=text[:30]):
+                self.assertIs(
+                    archive_intent.classify_session_intent(text).kind,
+                    archive_intent.IntentKind.NONE,
+                )
+
+
+class PlatformLockTest(unittest.TestCase):
+    def test_real_competing_process_times_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = str(pathlib.Path(temp) / "lock")
+            context = multiprocessing.get_context("spawn")
+            ready = context.Event()
+            release = context.Event()
+            process = context.Process(target=hold_file_lock, args=(path, ready, release))
+            process.start()
+            self.assertTrue(ready.wait(5))
+            try:
+                with self.assertRaises(platform_lock.LockTimeout):
+                    with platform_lock.file_lock(pathlib.Path(path), timeout=0.05):
+                        pass
+            finally:
+                release.set()
+                process.join(5)
+            self.assertEqual(process.exitcode, 0)
+
+    def test_mac_lock_acquires_and_releases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with platform_lock.file_lock(pathlib.Path(temp) / "lock", timeout=0.1):
+                self.assertTrue((pathlib.Path(temp) / "lock").exists())
+
+    def test_unsupported_platform_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            platform_lock.sys, "platform", "win32"
+        ):
+            with self.assertRaises(platform_lock.UnsupportedPlatform):
+                with platform_lock.file_lock(pathlib.Path(temp) / "lock"):
+                    pass
+
+    def test_busy_lock_times_out(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "fcntl.flock", side_effect=OSError(errno.EAGAIN, "busy")
+        ), mock.patch.object(platform_lock.time, "monotonic", side_effect=(0.0, 1.0)):
+            with self.assertRaises(platform_lock.LockTimeout):
+                with platform_lock.file_lock(pathlib.Path(temp) / "lock", timeout=0.1):
+                    pass
+
+    def test_busy_lock_retries_then_acquires(self):
+        busy = OSError(errno.EAGAIN, "busy")
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "fcntl.flock", side_effect=(busy, None, None)
+        ), mock.patch.object(platform_lock.time, "monotonic", side_effect=(0.0, 0.01, 0.02)):
+            with platform_lock.file_lock(pathlib.Path(temp) / "lock", timeout=0.1):
+                pass
+
+    def test_unexpected_lock_error_propagates(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "fcntl.flock", side_effect=OSError(errno.EPERM, "denied")
+        ):
+            with self.assertRaises(OSError):
+                with platform_lock.file_lock(pathlib.Path(temp) / "lock"):
+                    pass
+
+
+class CliFailureTest(unittest.TestCase):
+    def test_lock_timeout_returns_exit_four(self):
+        with mock.patch.object(ss, "_main", side_effect=platform_lock.LockTimeout("busy")):
+            self.assertEqual(ss.main([]), 4)
+
+    def test_migration_failure_returns_exit_five(self):
+        with mock.patch.object(
+            ss, "_main", side_effect=schema_migrations.MigrationFailure("partial")
+        ):
+            self.assertEqual(ss.main([]), 5)
+
+    def test_storage_failure_returns_exit_three(self):
+        with mock.patch.object(
+            ss, "_main", side_effect=archive_store.StorageFailure("read only")
+        ):
+            self.assertEqual(ss.main([]), 3)
+
+    def test_directory_fsync_failure_keeps_committed_selector(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "context.json"
+            real_fsync = ss.os.fsync
+            calls = 0
+
+            def fail_directory(fd):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("directory sync failed")
+                return real_fsync(fd)
+
+            stderr = io.StringIO()
+            with mock.patch.object(ss.os, "fsync", side_effect=fail_directory), contextlib.redirect_stderr(stderr):
+                ss.atomic_write_json(path, {"schema_version": 2, "results": []})
+            self.assertEqual(json.loads(path.read_text())["schema_version"], 2)
+            self.assertIn("committed", stderr.getvalue())

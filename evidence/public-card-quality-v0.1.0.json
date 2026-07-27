@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "corpus_version": 1,
+  "cases": 30,
+  "passed": 30,
+  "failed": 0,
+  "method": "Frozen synthetic inputs evaluated by tests/run_public_card_quality_eval.py"
+}

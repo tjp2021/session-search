@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install -e ".[semantic,dev]"
+      - run: coverage run --branch -m unittest discover -s tests -q
+      - run: coverage report --fail-under=90
+      - run: python tests/run_public_card_quality_eval.py
+      - run: python tests/run_public_retrieval_eval.py --mode hybrid
+      - run: python scripts/check_public_privacy.py
+      - run: ss demo
+
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build
+      - run: python -m build
+      - run: python -m venv /tmp/session-search-install
+      - run: /tmp/session-search-install/bin/pip install dist/*.whl
+      - run: /tmp/session-search-install/bin/ss capabilities
+      - run: /tmp/session-search-install/bin/ss demo

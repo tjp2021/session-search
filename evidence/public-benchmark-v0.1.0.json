@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "platform": "macOS-15.7.3-arm64-arm-64bit-Mach-O",
+    "python": "3.13.12"
+  },
+  "runs": [
+    {
+      "sessions": 100,
+      "documents": 100,
+      "cold_index_ms": 3.256,
+      "incremental_refresh_ms": 4.625,
+      "card_generation_ms": 27.951,
+      "embedding_ms": 1579.022,
+      "dashboard_ms": 2.179,
+      "queries": {
+        "fts": {"p50_ms": 1.049, "p95_ms": 18.614},
+        "local": {"p50_ms": 22.086, "p95_ms": 29.185},
+        "hybrid": {"p50_ms": 38.984, "p95_ms": 47.084}
+      }
+    },
+    {
+      "sessions": 1000,
+      "documents": 1000,
+      "cold_index_ms": 104.575,
+      "incremental_refresh_ms": 195.645,
+      "card_generation_ms": 273.24,
+      "embedding_ms": 6807.257,
+      "dashboard_ms": 1.587,
+      "queries": {
+        "fts": {"p50_ms": 8.412, "p95_ms": 19.449},
+        "local": {"p50_ms": 52.777, "p95_ms": 60.642},
+        "hybrid": {"p50_ms": 190.902, "p95_ms": 220.178}
+      }
+    }
+  ]
+}
