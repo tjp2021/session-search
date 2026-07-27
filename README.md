@@ -42,8 +42,12 @@ Run this from any folder:
 ss
 ```
 
-SS shows the most recent active sessions across all indexed folders. Each
-result explains:
+After a restart, that is the whole recovery loop. SS prints a work map:
+
+1. **Projects** — folders you were in, with the newest open number for each.
+2. **Threads** — the newest sessions under those projects.
+
+Every thread still keeps the recovery fields:
 
 - `About`: what the session concerned.
 - `State`: what happened or where the work stands.
@@ -59,7 +63,18 @@ ss open 4
 ```
 
 That's the normal workflow: run `ss`, identify the session, then open its
-number.
+number. Closed terminals do not erase sessions. Open numbers belong only to
+the screen you just saw, so run `ss` again in a new terminal before opening.
+
+Control how many threads appear on the map:
+
+```bash
+ss --limit 5
+```
+
+`--limit` is exact. If you ask for 5 sessions, SS shows 5 open numbers. Older
+projects can still appear in the project table so they do not vanish only
+because they sit outside the newest few threads.
 
 Inside the interactive dashboard, you can also:
 
@@ -71,7 +86,8 @@ Inside the interactive dashboard, you can also:
 
 | What you want | Command |
 | --- | --- |
-| See recent active sessions | `ss` |
+| See the project work map | `ss` |
+| Show exactly N newest threads | `ss --limit N` |
 | Search from memory | `ss <what you remember>` |
 | Force a fresh scan, then search | `ss fresh <what you remember>` |
 | Reopen the selected native session | `ss open N` |
