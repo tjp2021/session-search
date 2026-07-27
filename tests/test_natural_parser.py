@@ -1130,17 +1130,15 @@ class OutputShapeTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(conn, results)
         text = out.getvalue()
-        self.assertIn("SS WORK MAP", text)
-        self.assertIn("PROJECTS", text)
-        self.assertIn("THREADS", text)
-        self.assertIn("1. [Claude Code]", text)
-        self.assertIn("2. [Codex]", text)
+        self.assertIn("SS", text)
+        self.assertIn("1. Claude", text)
+        self.assertIn("2. Codex", text)
         self.assertIn("About: Claude planning work", text)
         self.assertIn(
             "State: No clear completed work found in local evidence.", text
         )
         self.assertIn("Resume: No clear next step found in local evidence.", text)
-        self.assertIn("Commands: ss <search> | ss open N | ss look at N | ss archive N | ss archived", text)
+        self.assertIn("ss open N", text)
         self.assertIn("Open: ss open 1", text)
         conn.close()
 
@@ -1236,7 +1234,7 @@ class OutputShapeTest(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(conn, archived, archived_view=True)
-        self.assertIn("Archived sessions", out.getvalue())
+        self.assertIn("SS archived", out.getvalue())
         self.assertIn("[ARCHIVED]", out.getvalue())
         conn.close()
 

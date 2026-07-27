@@ -42,19 +42,21 @@ Run this from any folder:
 ss
 ```
 
-After a restart, that is the whole recovery loop. SS prints a work map:
+After a restart, that is the whole recovery loop. SS prints a short grouped
+list, not a giant spreadsheet:
 
-1. **Projects** — folders you were in, with the newest open number for each.
-2. **Threads** — the newest sessions under those projects.
+- Project headers first (`Organic Growth`, `Personal / Career`, ...)
+- Threads under each project, with open numbers
+- One short `About` / `State` / `Resume` block per thread
+- A small footer of older projects still saved, if any
 
 Every thread still keeps the recovery fields:
 
 - `About`: what the session concerned.
 - `State`: what happened or where the work stands.
 - `Resume`: the best visible continuation point.
-- `Clue`: a useful path or distinctive search terms.
-- `Open`: reopen the exact native session when supported.
-- `Details`: inspect more indexed context without changing anything.
+- `Clue`: only when a real path or distinctive fact helps
+- `Open`: reopen the exact native session when supported
 
 If the right session is number 4:
 
@@ -66,15 +68,15 @@ That's the normal workflow: run `ss`, identify the session, then open its
 number. Closed terminals do not erase sessions. Open numbers belong only to
 the screen you just saw, so run `ss` again in a new terminal before opening.
 
-Control how many threads appear on the map:
+Control how many threads appear:
 
 ```bash
 ss --limit 5
 ```
 
 `--limit` is exact. If you ask for 5 sessions, SS shows 5 open numbers. Older
-projects can still appear in the project table so they do not vanish only
-because they sit outside the newest few threads.
+projects can still show in a short footer so they do not vanish only because
+they sit outside the newest few threads.
 
 Inside the interactive dashboard, you can also:
 

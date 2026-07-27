@@ -3784,13 +3784,39 @@ def dashboard_terminal_width() -> int:
     return max(60, min(width, 200))
 
 
+def dashboard_clean_text(value: str) -> str:
+    """Strip control junk that makes terminal paste unreadable."""
+    clean = sanitize_text(value)
+    clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", " ", clean)
+    clean = re.sub(r"\[[0-9;]{1,12}[A-Za-z]", " ", clean)
+    clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", clean)
+    return re.sub(r"\s+", " ", clean).strip()
+
+
 def dashboard_cell(value: str, width: int) -> str:
-    clean = re.sub(r"\s+", " ", sanitize_text(value)).strip()
+    clean = dashboard_clean_text(value)
     if width <= 1:
         return clean[:1]
     if len(clean) <= width:
         return clean
     return clean[: max(1, width - 1)].rstrip() + "…"
+
+
+def dashboard_relative_time(ts: int | None) -> str:
+    if not ts:
+        return "unknown"
+    now = now_ts()
+    delta = max(0, int(now) - int(ts))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    days = delta // 86400
+    if days < 14:
+        return f"{days}d ago"
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d")
 
 
 def _humanize_path_part(part: str) -> str:
@@ -3817,81 +3843,81 @@ def dashboard_project_label(repo: str) -> str:
     if os_at >= 0:
         relative = parts[os_at + 1 :]
         if not relative:
-            return "Workspace home"
+            return "OS root"
         if len(relative) >= 2:
             return f"{_humanize_path_part(relative[0])} / {_humanize_path_part(relative[1])}"
         return _humanize_path_part(relative[0])
 
-    # Other paths: keep last two meaningful parts.
     useful = [part for part in parts if part not in {".", ""}]
+    # Hide machine-history paths and bare home noise from the main map labels.
+    joined = "/".join(useful).lower()
+    if joined.endswith("history.jsonl") or "/.codex/" in f"/{joined}/":
+        return "Codex history"
     if len(useful) >= 2:
         return " / ".join(_humanize_path_part(part) for part in useful[-2:])
     return _humanize_path_part(useful[-1])
 
 
+def dashboard_project_is_noise(project: str, repo: str = "") -> bool:
+    """Drop path debris that should not dominate the restart map."""
+    name = dashboard_clean_text(project).lower()
+    path = dashboard_clean_text(repo).lower()
+    if not name or name in {"unknown folder", "untitled session"}:
+        return True
+    noisy = (
+        "history.jsonl",
+        "codex history",
+        ".codex",
+        "node_modules",
+        "untitled",
+    )
+    if any(token in name for token in noisy):
+        return True
+    if any(token in path for token in ("history.jsonl", "/.codex/", "/node_modules/")):
+        return True
+    return False
+
+
+def dashboard_short_tool(source_label_text: str) -> str:
+    mapping = {
+        "Claude Code": "Claude",
+        "Codex": "Codex",
+        "VS Code / Copilot": "Copilot",
+        "Cursor": "Cursor",
+        "Pi": "Pi",
+    }
+    return mapping.get(source_label_text, source_label_text)
+
+
 def print_dashboard_table(headers: list[str], rows: list[list[str]], width: int | None = None) -> None:
-    """Render a plain terminal table and shrink cells to fit the live width."""
+    """Render a plain terminal table when a compact matrix is actually useful."""
     if not headers:
         return
     term_width = dashboard_terminal_width() if width is None else max(40, width)
     col_count = len(headers)
-    separator_tax = 3 * max(0, col_count - 1)  # " | " between columns
+    separator_tax = 3 * max(0, col_count - 1)
     available = max(col_count * 4, term_width - separator_tax)
-    # Give earlier columns a stable minimum; pour remainder into the last column.
-    min_widths = []
-    for index, header in enumerate(headers):
-        name = header.lower()
-        if index == 0 or name in {"open", "threads"}:
-            min_widths.append(max(len(header), 4))
-        elif name in {"project", "tool"}:
-            min_widths.append(max(len(header), 14))
-        elif index == col_count - 1:
-            min_widths.append(max(len(header), 14))
-        else:
-            min_widths.append(max(len(header), 10))
-    while sum(min_widths) > available and any(value > 4 for value in min_widths[1:]):
-        # Shrink supporting columns before the Open index.
-        for index in range(col_count - 2, 0, -1):
-            if min_widths[index] > 4 and sum(min_widths) > available:
-                min_widths[index] -= 1
-    remainder = max(0, available - sum(min_widths))
-    widths = list(min_widths)
-    project_indexes = [i for i, header in enumerate(headers) if header.lower() in {"project", "tool"}]
-    if project_indexes and remainder:
-        give = max(remainder // 2, 0)
-        each = give // len(project_indexes)
-        leftover = give - each * len(project_indexes)
-        for index in project_indexes:
-            widths[index] += each
-        if project_indexes:
-            widths[project_indexes[0]] += leftover
-        remainder -= give
+    widths = [max(len(header), 4) for header in headers]
+    while sum(widths) > available and any(value > 4 for value in widths[1:]):
+        for index in range(col_count - 1, 0, -1):
+            if widths[index] > 4 and sum(widths) > available:
+                widths[index] -= 1
+    remainder = max(0, available - sum(widths))
     widths[-1] += remainder
-
-    fitted_rows: list[list[str]] = []
-    for row in rows:
-        fitted = []
-        for index, cell in enumerate(row):
-            fitted.append(dashboard_cell(str(cell), widths[index]))
-        fitted_rows.append(fitted)
-
     print(" | ".join(headers[i].ljust(widths[i]) for i in range(col_count)))
     print("-+-".join("-" * widths[i] for i in range(col_count)))
-    for row in fitted_rows:
-        print(" | ".join(row[i].ljust(widths[i]) for i in range(col_count)))
+    for row in rows:
+        fitted = [dashboard_cell(str(cell), widths[i]) for i, cell in enumerate(row)]
+        print(" | ".join(fitted[i].ljust(widths[i]) for i in range(col_count)))
 
 
 def dashboard_project_summaries(
     conn: sqlite3.Connection,
     source_name: str = "all",
     thread_limit: int = 10,
-    project_scan_limit: int = 500,
+    project_scan_limit: int = 250,
 ) -> list[dict[str, Any]]:
-    """Build project rows from a wider scan than the visible thread feed.
-
-    The visible thread list stays limit-honest. This companion map may look
-    farther back so older projects do not disappear after a restart.
-    """
+    """Build clean project rows from a wider scan than the visible thread feed."""
     scan_limit = max(int(thread_limit), int(project_scan_limit), 1)
     scanned = recent_session_results(conn, scan_limit, source_name, archived_only=False)
     groups: dict[str, dict[str, Any]] = {}
@@ -3901,6 +3927,8 @@ def dashboard_project_summaries(
         about, _state, _resume, _clue = dashboard_summary(card, rows, row)
         repo = card.repo or location_label(row)
         project = dashboard_project_label(repo)
+        if dashboard_project_is_noise(project, repo):
+            continue
         bucket = groups.setdefault(
             project,
             {
@@ -3910,6 +3938,7 @@ def dashboard_project_summaries(
                 "latest_about": about,
                 "latest_session_id": card.session_id,
                 "latest_source": card.source,
+                "repo": repo,
             },
         )
         bucket["count"] += 1
@@ -3919,6 +3948,7 @@ def dashboard_project_summaries(
             bucket["latest_about"] = about
             bucket["latest_session_id"] = card.session_id
             bucket["latest_source"] = card.source
+            bucket["repo"] = repo
     ordered = sorted(
         groups.values(),
         key=lambda item: (-int(item["latest_ts"] or 0), str(item["project"]).lower()),
@@ -3932,13 +3962,12 @@ def print_dashboard(
     archived_view: bool = False,
     project_summaries: list[dict[str, Any]] | None = None,
 ) -> None:
+    """Restart recovery screen: sparse, grouped, scannable."""
     width = dashboard_terminal_width()
-    print("SS WORK MAP")
-    print("Archived sessions" if archived_view else "Your saved work, organized by project")
-    print("Nothing on this screen needs an open terminal tab. Closed chats stay saved.")
-    print()
+    title = "SS archived" if archived_view else "SS"
+    print(title)
     if not results:
-        print("No Claude Code or Codex sessions are indexed yet.")
+        print("No saved Claude/Codex sessions yet.")
         print("Run: ss fresh what did I work on recently")
         return
 
@@ -3950,7 +3979,7 @@ def print_dashboard(
         repo = card.repo or location_label(row)
         project = dashboard_project_label(repo)
         archived = session_is_archived(conn, card.source, card.session_id)
-        if archived:
+        if archived and not project.endswith(" [ARCHIVED]"):
             project_display = f"{project} [ARCHIVED]"
         else:
             project_display = project
@@ -3959,113 +3988,90 @@ def print_dashboard(
                 "rank": rank,
                 "row": row,
                 "card": card,
-                "about": about,
-                "state": state,
-                "resume": resume,
-                "clue": clue,
+                "about": dashboard_clean_text(about),
+                "state": dashboard_clean_text(state),
+                "resume": dashboard_clean_text(resume),
+                "clue": dashboard_clean_text(clue),
                 "project": project_display,
                 "source": source_label(str(row["source"])),
-                "when": iso_date(card.last_active),
+                "when": dashboard_relative_time(card.last_active),
                 "repo": repo,
                 "archived": archived,
             }
         )
 
-    # Project map may include older folders beyond the visible thread limit.
-    if project_summaries is None:
-        if archived_view:
-            project_summaries = []
-            grouped: dict[str, dict[str, Any]] = {}
-            for entry in thread_entries:
-                bucket = grouped.setdefault(
-                    entry["project"],
-                    {
-                        "project": entry["project"],
-                        "count": 0,
-                        "latest_ts": entry["card"].last_active or 0,
-                        "latest_about": entry["about"],
-                        "latest_open": entry["rank"],
-                    },
-                )
-                bucket["count"] += 1
-                ts = entry["card"].last_active or 0
-                if ts >= int(bucket["latest_ts"] or 0):
-                    bucket["latest_ts"] = ts
-                    bucket["latest_about"] = entry["about"]
-                    bucket["latest_open"] = entry["rank"]
-            project_summaries = sorted(
-                grouped.values(),
-                key=lambda item: (-int(item["latest_ts"] or 0), str(item["project"]).lower()),
-            )
-        else:
-            project_summaries = dashboard_project_summaries(
-                conn,
-                source_name="all",
-                thread_limit=len(results),
-            )
-
-    # Attach the open number of the newest *visible* thread for each project.
-    visible_open_by_project: dict[str, int] = {}
+    # Group the visible threads under projects. This is the main scan surface.
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
     for entry in thread_entries:
-        base_project = entry["project"].removesuffix(" [ARCHIVED]")
-        if base_project not in visible_open_by_project:
-            visible_open_by_project[base_project] = int(entry["rank"])
+        key = str(entry["project"])
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(entry)
+    for key in order:
+        groups.append((key, grouped[key]))
 
-    print("PROJECTS")
-    print(dashboard_cell(
-        "A number is the newest visible thread for that project. Dash means older than this list.",
-        width,
-    ))
-    project_rows: list[list[str]] = []
-    for item in project_summaries:
-        project_name = str(item["project"])
-        base_name = project_name.removesuffix(" [ARCHIVED]")
-        open_rank = item.get("latest_open") or visible_open_by_project.get(base_name)
-        open_label = str(open_rank) if open_rank else "-"
-        project_rows.append(
-            [
-                open_label,
-                project_name,
-                iso_date(item.get("latest_ts")),
-                str(item.get("count") or 0),
-                str(item.get("latest_about") or ""),
-            ]
+    if project_summaries is None and not archived_view:
+        project_summaries = dashboard_project_summaries(
+            conn,
+            source_name="all",
+            thread_limit=len(results),
         )
-    print_dashboard_table(
-        ["Open", "Project", "Last worked", "Threads", "Latest work"],
-        project_rows,
-        width=width,
-    )
 
+    # Quiet "more projects" footer: only projects not already on screen.
+    visible_projects = {name.removesuffix(" [ARCHIVED]") for name, _items in groups}
+    more_projects: list[dict[str, Any]] = []
+    if project_summaries:
+        for item in project_summaries:
+            name = str(item.get("project") or "")
+            if not name or name in visible_projects:
+                continue
+            if dashboard_project_is_noise(name, str(item.get("repo") or "")):
+                continue
+            more_projects.append(item)
+        more_projects = more_projects[:8]
+
+    print(f"{len(thread_entries)} recent thread{'s' if len(thread_entries) != 1 else ''} · open with: ss open N")
     print()
-    print("THREADS")
-    print(f"Showing {len(thread_entries)} session{'s' if len(thread_entries) != 1 else ''}. Open numbers match this screen only.")
-    body_width = max(40, width - 4)
-    for entry in thread_entries:
-        marker = session_status_marker(bool(entry["archived"]))
+
+    body_width = max(28, width - 2)
+    for project_name, items in groups:
+        latest = items[0]
+        header = f"{project_name}  ·  {latest['when']}  ·  {len(items)} shown"
+        print(dashboard_cell(header, width))
+        # Keep one short folder line only when it adds information.
+        folder = repo_label(latest["repo"])
+        if folder and folder not in {"unknown", "unknown from index"}:
+            print(dashboard_cell(f"  {folder}", width))
+        for entry in items:
+            tool = dashboard_short_tool(str(entry["source"]))
+            marker = " [ARCHIVED]" if entry["archived"] and "[ARCHIVED]" not in project_name else ""
+            print()
+            print(dashboard_cell(f"  {entry['rank']}. {tool}{marker} · {entry['when']}", width))
+            about = entry["about"] or "Untitled session."
+            state = entry["state"] or "No clear completed work found in local evidence."
+            resume = entry["resume"] or "No clear next step found in local evidence."
+            # Keep literal "About"/"State"/"Resume" markers for behavior contracts and muscle memory.
+            print(dashboard_cell("     " + f"About: {about}", body_width))
+            print(dashboard_cell("     " + f"State: {state}", body_width))
+            print(dashboard_cell("     " + f"Resume: {resume}", body_width))
+            if entry["clue"] and not entry["clue"].lower().startswith("key terms:"):
+                print(dashboard_cell("     " + f"Clue: {entry['clue']}", body_width))
+            print(f"     Open: ss open {entry['rank']}")
         print()
-        title_line = f"{entry['rank']}. [{entry['source']}]{marker} {entry['card'].title}"
-        print(dashboard_cell(title_line, width))
-        print(dashboard_cell(f"   Project: {entry['project']}", width))
-        print(dashboard_cell(f"   Folder: {repo_label(entry['repo'])}", width))
-        print(dashboard_cell(f"   Last worked: {entry['when']}", width))
-        about = entry["about"]
-        state = entry["state"]
-        resume = entry["resume"]
-        clue = entry["clue"]
-        # Keep the required About/State/Resume markers; trim values to terminal width.
-        about = dashboard_cell(about, max(12, body_width - len("About: ")))
-        state = dashboard_cell(state, max(12, body_width - len("State: ")))
-        resume = dashboard_cell(resume, max(12, body_width - len("Resume: ")))
-        print(f"   About: {about}")
-        print(f"   State: {state}")
-        print(f"   Resume: {resume}")
-        if clue:
-            print(dashboard_cell(f"   Clue: {clue}", width))
-        print(f"   Open: ss open {entry['rank']}    Details: ss look at {entry['rank']}")
 
-    print()
-    print("Commands: ss <search> | ss open N | ss look at N | ss archive N | ss archived")
+    if more_projects:
+        print("Older projects still saved:")
+        for item in more_projects:
+            when = dashboard_relative_time(item.get("latest_ts"))
+            about = dashboard_cell(str(item.get("latest_about") or ""), max(20, width - 36))
+            print(dashboard_cell(f"  - {item['project']} · {when} · {item.get('count', 0)} threads · {about}", width))
+        print("  Search one: ss <words>    See finished: ss archived")
+        print()
+
+    print("ss <search> · ss open N · ss look at N · ss archive N · ss archived")
 
 
 def dashboard_is_interactive() -> bool:

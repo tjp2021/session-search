@@ -42,10 +42,14 @@ class DashboardBehaviorContracts(unittest.TestCase):
         dashboard_start = source.index("def print_dashboard(")
         dashboard_end = source.index("\ndef dashboard_is_interactive", dashboard_start)
         dashboard = source[dashboard_start:dashboard_end]
-        self.assertIn('print(f"   About: {about}")', dashboard)
-        self.assertIn('print(f"   State: {state}")', dashboard)
-        self.assertIn('print(f"   Resume: {resume}")', dashboard)
-        self.assertIn('SS WORK MAP', dashboard)
+        self.assertTrue(
+            'About: {about}' in dashboard or 'f"About: {about}"' in dashboard or "About: {about}" in dashboard
+        )
+        self.assertTrue('State: {state}' in dashboard or 'f"State: {state}"' in dashboard)
+        self.assertTrue('Resume: {resume}' in dashboard or 'f"Resume: {resume}"' in dashboard)
+        # Restart screen identity markers.
+        self.assertIn('print(title)', dashboard)
+        self.assertIn('ss open N', dashboard)
 
 
 if __name__ == "__main__":

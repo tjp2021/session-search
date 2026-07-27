@@ -126,8 +126,9 @@ class DashboardWorkMapContracts(unittest.TestCase):
         self.assertIn("About:", text)
         self.assertIn("State:", text)
         self.assertIn("Resume:", text)
-        self.assertIn("SS WORK MAP", text)
-        self.assertIn("PROJECTS", text)
+        self.assertIn("SS", text)
+        self.assertIn("About:", text)
+        self.assertIn("Open: ss open", text)
 
     def test_project_grouping_is_deterministic_and_human_readable(self) -> None:
         self.assertEqual(
@@ -169,8 +170,9 @@ class DashboardWorkMapContracts(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(self.conn, results)
         text = out.getvalue()
-        self.assertGreaterEqual(text.count("Shared / Session Search"), 2)
-        self.assertIn("Open |", text)
+        self.assertGreaterEqual(text.count("Shared / Session Search"), 1)
+        self.assertIn("About:", text)
+        self.assertNotIn("Open | Project", text)
 
     def test_full_index_project_discovery_keeps_older_projects(self) -> None:
         # 5 newest sessions in project A, 1 older project B that must still appear
@@ -229,7 +231,7 @@ class DashboardWorkMapContracts(unittest.TestCase):
             ss.print_dashboard(self.conn, results)
         text = out.getvalue()
         self.assertLess(text.index("Open: ss open 1"), text.index("Open: ss open 2"))
-        self.assertIn("gamma", text.split("Open: ss open 1", 1)[0].splitlines()[-5])
+        self.assertIn("Research / Gamma", text.split("Open: ss open 1", 1)[0])
 
     def test_archived_sessions_are_separate_and_marked(self) -> None:
         _seed_session(
@@ -264,7 +266,7 @@ class DashboardWorkMapContracts(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(self.conn, archived, archived_view=True)
         text = out.getvalue()
-        self.assertIn("Archived", text)
+        self.assertIn("SS archived", text)
         self.assertIn("[ARCHIVED]", text)
 
     def test_tables_fit_common_terminal_widths(self) -> None:
@@ -339,6 +341,61 @@ class DashboardWorkMapContracts(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("Best matches for:", text)
         self.assertIn("zucchini", text.lower())
+
+
+    def test_default_dashboard_is_sparse_and_grouped(self) -> None:
+        _seed_session(
+            self.conn,
+            source="claude",
+            session_id="a",
+            cwd="/Users/alex/workspace/os/_shared/session-search",
+            title="A",
+            about="First shared session",
+            state="Indexed cards",
+            resume="Open the thread",
+            ts=200,
+        )
+        _seed_session(
+            self.conn,
+            source="codex",
+            session_id="b",
+            cwd="/Users/alex/workspace/os/organic-growth",
+            title="B",
+            about="Second growth session",
+            state="Mapped folders",
+            resume="Choose market",
+            ts=100,
+        )
+        # noisy junk should not dominate
+        _seed_session(
+            self.conn,
+            source="codex",
+            session_id="noise",
+            cwd="/Users/alex/.codex/history.jsonl",
+            title="noise",
+            about="history row",
+            state="ignore",
+            resume="ignore",
+            ts=50,
+        )
+        results = ss.recent_session_results(self.conn, 10, "all")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ss.print_dashboard(self.conn, results)
+        text = out.getvalue()
+        self.assertNotIn("SS WORK MAP", text)
+        self.assertNotIn("PROJECTS", text)
+        self.assertNotIn("Open |", text)
+        self.assertNotIn("Latest work", text)
+        self.assertIn("Shared / Session Search", text)
+        self.assertIn("Organic Growth", text)
+        self.assertIn("About:", text)
+        self.assertIn("State:", text)
+        self.assertIn("Resume:", text)
+        # No giant ASCII table separators
+        self.assertNotIn("-----+-+-", text)
+        # Noise path should not appear as a main project header
+        self.assertNotIn("History.Jsonl", text)
 
 
 if __name__ == "__main__":
