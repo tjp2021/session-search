@@ -3840,12 +3840,15 @@ def print_dashboard_table(headers: list[str], rows: list[list[str]], width: int 
     # Give earlier columns a stable minimum; pour remainder into the last column.
     min_widths = []
     for index, header in enumerate(headers):
-        if index == 0:
+        name = header.lower()
+        if index == 0 or name in {"open", "threads"}:
             min_widths.append(max(len(header), 4))
+        elif name in {"project", "tool"}:
+            min_widths.append(max(len(header), 14))
         elif index == col_count - 1:
-            min_widths.append(max(len(header), 12))
+            min_widths.append(max(len(header), 14))
         else:
-            min_widths.append(max(len(header), 8))
+            min_widths.append(max(len(header), 10))
     while sum(min_widths) > available and any(value > 4 for value in min_widths[1:]):
         # Shrink supporting columns before the Open index.
         for index in range(col_count - 2, 0, -1):
@@ -3853,6 +3856,16 @@ def print_dashboard_table(headers: list[str], rows: list[list[str]], width: int 
                 min_widths[index] -= 1
     remainder = max(0, available - sum(min_widths))
     widths = list(min_widths)
+    project_indexes = [i for i, header in enumerate(headers) if header.lower() in {"project", "tool"}]
+    if project_indexes and remainder:
+        give = max(remainder // 2, 0)
+        each = give // len(project_indexes)
+        leftover = give - each * len(project_indexes)
+        for index in project_indexes:
+            widths[index] += each
+        if project_indexes:
+            widths[project_indexes[0]] += leftover
+        remainder -= give
     widths[-1] += remainder
 
     fitted_rows: list[list[str]] = []
@@ -3999,7 +4012,10 @@ def print_dashboard(
             visible_open_by_project[base_project] = int(entry["rank"])
 
     print("PROJECTS")
-    print("Newest visible thread number is the Fast open. Older projects can still appear here.")
+    print(dashboard_cell(
+        "A number is the newest visible thread for that project. Dash means older than this list.",
+        width,
+    ))
     project_rows: list[list[str]] = []
     for item in project_summaries:
         project_name = str(item["project"])
