@@ -81,7 +81,10 @@ def doc(**values):
 
 class InstalledLauncherTest(unittest.TestCase):
     def test_launcher_exports_natural_mode_before_exec(self):
-        launcher = (ROOT / "ss_launcher.sh").read_text(encoding="utf-8")
+        launcher_path = ROOT / "ss_launcher.sh"
+        if not launcher_path.exists():
+            self.skipTest("private operator launcher is not part of the public package")
+        launcher = launcher_path.read_text(encoding="utf-8")
         export_at = launcher.index("export SS_NATURAL=1")
         exec_at = launcher.index('exec "$PY" "$ROOT/session_search.py" "$@"')
         self.assertLess(export_at, exec_at)
