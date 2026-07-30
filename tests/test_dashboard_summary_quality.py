@@ -37,7 +37,7 @@ class SummaryQuality(unittest.TestCase):
 
     def test_shell_paste_not_about(self):
         row = seed(self.conn, source="claude", session_id="s1", cwd="/tmp/os",
-            users=["alex@host ~ % ss qvac", "Please fix Hermes gateway and bookmark scraper watchdog alerts."],
+            users=["alex@host ~ % ss qvac", "Please fix the Hermes gateway and the bookmark scraper watchdog alerts."],
             assistants=["Implemented gateway recovery and restored the scraper schedule.",
                         "Next need to verify the watchdog no longer red-alerts."], title="Fix Hermes gateway")
         card = ss.session_card_for_result(self.conn, row, "")

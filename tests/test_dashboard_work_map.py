@@ -182,8 +182,8 @@ class DashboardWorkMapContracts(unittest.TestCase):
                 self.conn,
                 source="codex",
                 session_id=f"new-{index}",
-                cwd="/Users/alex/workspace/os/og/lakeside-clinic",
-                title=f"OG {index}",
+                cwd="/Users/alex/workspace/os/agency/lakeside-clinic",
+                title=f"Agency {index}",
                 about=f"Lakeside Clinic thread {index}",
                 state="Recent client work",
                 resume="Continue the audit",
@@ -202,7 +202,7 @@ class DashboardWorkMapContracts(unittest.TestCase):
         )
         projects = ss.dashboard_project_summaries(self.conn, source_name="all", thread_limit=3)
         names = [item["project"] for item in projects]
-        self.assertIn("Og / Lakeside Clinic", names)
+        self.assertIn("Agency / Lakeside Clinic", names)
         self.assertIn("Robots", names)
 
     def test_open_numbers_match_saved_selector_order(self) -> None:
