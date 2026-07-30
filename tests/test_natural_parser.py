@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import sqlite3
 import sys
 import tempfile
@@ -29,6 +30,8 @@ def load_module():
 
 
 ss = load_module()
+
+from card_quality import clean_card_field  # noqa: E402  (import after sys.path setup)
 
 
 def make_row(**values):
@@ -86,8 +89,20 @@ class InstalledLauncherTest(unittest.TestCase):
             self.skipTest("private operator launcher is not part of the public package")
         launcher = launcher_path.read_text(encoding="utf-8")
         export_at = launcher.index("export SS_NATURAL=1")
-        exec_at = launcher.index('exec "$PY" "$ROOT/session_search.py" "$@"')
-        self.assertLess(export_at, exec_at)
+        execs = [
+            match for match in re.finditer(r"^[ \t]*exec[ \t]+(?P<target>.+)$", launcher, re.M)
+        ]
+        self.assertTrue(execs, "launcher never execs an interpreter")
+        for match in execs:
+            target = match.group("target")
+            # Every exec must run session-search itself. A launcher that execs
+            # anything else is not this launcher.
+            self.assertIn("session_search", target, f"launcher execs {target!r}")
+            self.assertLess(export_at, match.start(), "natural mode must be exported first")
+            # The script's own comment calls this load-bearing: execing from the
+            # private mirror lets that copy shadow the installed package.
+            cd_root = launcher.rfind("cd /", 0, match.start())
+            self.assertGreater(cd_root, export_at, f"exec at {match.start()} is not preceded by cd /")
 
     def test_bare_python_entrypoint_uses_dashboard_without_environment_flag(self):
         with mock.patch.object(ss, "cmd_natural", return_value=0) as natural:
@@ -530,6 +545,28 @@ class RerankTest(unittest.TestCase):
 
 
 class SessionCardTest(unittest.TestCase):
+    def test_llm_about_uses_one_sentence_prompt(self):
+        row = make_row(text="We fixed the session-search dashboard and rebuilt its cache.")
+        prompts: list[tuple[str, int]] = []
+
+        def summarize(prompt: str, max_tokens: int = 220) -> str:
+            prompts.append((prompt, max_tokens))
+            if prompt.startswith("Summarize what this session was about"):
+                return "Fixed the session-search dashboard and rebuilt its cached cards."
+            return "Verify the refreshed dashboard output."
+
+        with mock.patch.object(ss, "llm_summarize", side_effect=summarize):
+            card = ss.build_session_card([row], row, "", use_llm=True)
+
+        about_prompt, about_tokens = prompts[0]
+        self.assertIn("exactly 1 sentence", about_prompt)
+        self.assertNotIn("2 sentences", about_prompt)
+        self.assertLessEqual(about_tokens, 160)
+        self.assertEqual(
+            card.what_this_was,
+            "Fixed the session-search dashboard and rebuilt its cached cards.",
+        )
+
     def test_card_name_uses_last_user_message_timestamp_and_summary_keeps_message(self):
         rows = [
             make_row(doc_id="u1", role="user", ts=1_700_000_000, title="Deploy Northstar Clinic", text="Start the deploy."),
@@ -1064,6 +1101,67 @@ class VisibleEvalTest(unittest.TestCase):
 
 
 class OutputShapeTest(unittest.TestCase):
+    def test_dashboard_runs_catch_up_before_rendering(self):
+        conn = make_conn_with_docs(
+            [doc(doc_id="doc-1", session_id="session-1", text="Fresh dashboard work.", ts=1)]
+        )
+        results = ss.recent_session_results(conn, 1)
+        with mock.patch.object(
+            ss,
+            "llm_summarize",
+            side_effect=["Summarized the fresh dashboard work.", "Resume the fresh dashboard work."],
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                ss.print_dashboard(conn, results)
+
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 1)
+        conn.close()
+
+    def test_dashboard_catch_up_builds_at_most_ten_missing_cards(self):
+        conn = make_conn_with_docs(
+            [
+                doc(
+                    doc_id=f"doc-{index}",
+                    session_id=f"session-{index}",
+                    title=f"Session {index}",
+                    text=f"Work item {index} needs a useful summary.",
+                    ts=index,
+                )
+                for index in range(12)
+            ]
+        )
+        results = ss.recent_session_results(conn, 12)
+
+        def summarize(prompt: str, max_tokens: int = 220) -> str:
+            if prompt.startswith("Summarize what this session was about"):
+                return "Summarized the concrete work in this session."
+            return "Resume the next concrete step."
+
+        with mock.patch.object(ss, "llm_summarize", side_effect=summarize) as llm:
+            built = ss.catch_up_dashboard_cards(conn, results, limit=10)
+
+        self.assertEqual(built, 10)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 10)
+        self.assertEqual(llm.call_count, 20)
+        conn.close()
+
+    def test_dashboard_catch_up_skips_current_cached_cards(self):
+        conn = make_conn_with_docs(
+            [doc(doc_id="doc-1", session_id="session-1", text="Cached dashboard work.", ts=1)]
+        )
+        results = ss.recent_session_results(conn, 1)
+        with mock.patch.object(
+            ss,
+            "llm_summarize",
+            side_effect=["Summarized the cached work.", "Resume the cached work."],
+        ):
+            self.assertEqual(ss.catch_up_dashboard_cards(conn, results, limit=10), 1)
+
+        with mock.patch.object(ss, "llm_summarize") as llm:
+            self.assertEqual(ss.catch_up_dashboard_cards(conn, results, limit=10), 0)
+        llm.assert_not_called()
+        conn.close()
+
     def test_dashboard_refresh_only_reads_changed_claude_files_and_recent_codex(self):
         conn = make_conn_with_docs(
             [
@@ -1130,16 +1228,14 @@ class OutputShapeTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ss.print_dashboard(conn, results)
         text = out.getvalue()
-        self.assertIn("SS", text)
-        self.assertIn("1. Claude", text)
-        self.assertIn("2. Codex", text)
+        # The sparse work map replaced the table dashboard: project headers,
+        # About/State/Resume blocks, and per-thread open numbers.
         self.assertIn("About: Claude planning work.", text)
-        self.assertIn(
-            "State: No clear completed work found in local evidence.", text
-        )
-        self.assertIn("Resume: No clear next step found in local evidence.", text)
-        self.assertIn("ss open N", text)
+        self.assertIn("About: Codex implementation.", text)
         self.assertIn("Open: ss open 1", text)
+        self.assertIn("Open: ss open 2", text)
+        self.assertIn("open with: ss open N", text)
+        self.assertNotIn("SS WORK MAP", text)
         conn.close()
 
     def test_dashboard_excludes_injected_context_as_last_user_message(self):
@@ -1400,13 +1496,444 @@ class OutputShapeTest(unittest.TestCase):
             evidence=(),
         )
         about, state, resume, clue = ss.dashboard_summary(card, rows, rows[-1])
+        # This card is regex evidence, not a model summary, so About stays the
+        # session topic and the evidence line remains available as state.
         self.assertEqual(about, "Osmo x402.")
         self.assertEqual(state, "Osmo x402: The curriculum-import architecture was decided.")
         self.assertEqual(
             resume,
             "The x402 pilot still needed its first complete lesson/card/grade cycle before bulk agentic-commerce import.",
         )
-        self.assertEqual(clue, "")  # no key-terms soup; path-only clues
+        # The work map dropped key-terms clues: a clue is shown only when a
+        # real path adds information.
+        self.assertEqual(clue, "")
+
+    def test_dashboard_about_prefers_cached_llm_summary_over_title(self):
+        rows = [
+            make_row(
+                doc_id="only",
+                title="Two answers",
+                text="alex@mac ~ % ss --limit 8\nTwo answers.",
+                ts=100,
+            ),
+        ]
+        card = ss.SessionCard(
+            title="22/07/26 12:14:46 — Two answers",
+            source="claude",
+            session_id="cards",
+            repo="/Users/alex/workspace/os/_shared/session-search",
+            last_active=100,
+            last_user_message=rows[-1]["text"],
+            what_this_was="Cached the one-line session summaries so the dashboard stops calling the LLM.",
+            what_happened="",
+            next_clue="Fix the candidate title leak.",
+            mentioned_paths=(),
+            evidence=(),
+            summary_source=ss.SUMMARY_SOURCE_LLM,
+        )
+        about, _state, _resume, _clue = ss.dashboard_summary(card, rows, rows[-1])
+        self.assertIn("cached the one-line session summaries", about.lower())
+        self.assertNotIn("two answers", about.lower())
+
+    def test_backfill_stops_at_the_horizon(self):
+        conn = make_conn_with_docs(
+            [
+                doc(doc_id=f"d{i}", session_id=f"s{i}", title=f"S{i}", text=f"Work {i}.", ts=i)
+                for i in range(8)
+            ]
+        )
+        with mock.patch.object(ss, "llm_summarize", return_value="Summarized the work."):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                built = ss.ensure_session_cards(conn, horizon=3)
+        self.assertEqual(built, 3, "backfill must not summarize every session it can see")
+        newest = {row[0] for row in conn.execute("SELECT session_id FROM session_cards")}
+        self.assertEqual(newest, {"s7", "s6", "s5"}, "the horizon must cover the newest sessions")
+        conn.close()
+
+    def test_a_session_past_the_horizon_is_summarized_when_searched(self):
+        conn = make_conn_with_docs(
+            [
+                doc(doc_id=f"d{i}", session_id=f"s{i}", title=f"S{i}", text=f"Work {i}.", ts=i)
+                for i in range(8)
+            ]
+        )
+        with mock.patch.object(ss, "llm_summarize", return_value="Summarized the work."):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                    ss.ensure_session_cards(conn, horizon=3)
+                    old = conn.execute("SELECT * FROM documents WHERE session_id = 's0'").fetchone()
+                    self.assertIsNone(
+                        conn.execute(
+                            "SELECT 1 FROM session_cards WHERE session_id = 's0'"
+                        ).fetchone()
+                    )
+                    card = ss.session_card_for_result(conn, old, "work", persist=True)
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_LLM)
+        self.assertIsNotNone(
+            conn.execute("SELECT 1 FROM session_cards WHERE session_id = 's0'").fetchone(),
+            "an on-demand summary must be cached so the text is sent once",
+        )
+        conn.close()
+
+    def test_the_search_path_itself_caches_an_on_demand_summary(self):
+        # Asserting the helper caches is not enough; the production search path
+        # must ask it to. If print_results stopped persisting, every search
+        # would re-send the same session text forever.
+        conn = make_conn_with_docs(
+            [doc(doc_id="d0", session_id="s0", title="S0", text="Rebuilt the exporter.", ts=1)]
+        )
+        results = ss.recent_session_results(conn, 1)
+        with mock.patch.object(ss, "llm_summarize", return_value="Rebuilt the exporter.") as llm:
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ss.print_results(conn, results, "exporter")
+                first = llm.call_count
+                self.assertGreater(first, 0, "the first search must build the card")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ss.print_results(conn, results, "exporter")
+                self.assertEqual(llm.call_count, first, "a repeated search must not re-send the text")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 1)
+        conn.close()
+
+    def test_backfill_defaults_to_the_configured_horizon(self):
+        # Every other horizon test passes one explicitly, so without this the
+        # default binding could break and routine backfill would quietly go
+        # back to summarizing every session in the index.
+        conn = make_conn_with_docs([doc(doc_id="d0", session_id="s0", text="Work.", ts=1)])
+        with mock.patch.object(ss, "session_groups", return_value=[]) as groups:
+            ss.ensure_session_cards(conn)
+        self.assertEqual(groups.call_args.kwargs.get("limit"), ss.CARD_BACKFILL_SESSIONS)
+        conn.close()
+
+    def test_the_horizon_covers_every_row_the_dashboard_can_show(self):
+        # cmd_dashboard asks for max(args.limit, 50) sessions. A horizon at or
+        # below that would leave visible rows permanently unsummarized.
+        self.assertGreater(ss.CARD_BACKFILL_SESSIONS, 50)
+
+    def test_edited_session_text_invalidates_the_cached_card(self):
+        conn = make_conn_with_docs([doc(doc_id="d1", session_id="s1", text="Rebuilt it.", ts=1)])
+        results = ss.recent_session_results(conn, 1)
+        with mock.patch.object(ss, "llm_summarize", return_value="Rebuilt the exporter."):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                self.assertEqual(ss.catch_up_dashboard_cards(conn, results), 1)
+                # Same session, new text: the cached summary is now wrong.
+                ss.upsert_documents(
+                    conn, [doc(doc_id="d1", session_id="s1", text="Rewrote the payout retry.", ts=1)]
+                )
+                results = ss.recent_session_results(conn, 1)
+                with mock.patch.object(ss, "llm_summarize", return_value="Rewrote the payout retry."):
+                    self.assertEqual(ss.catch_up_dashboard_cards(conn, results), 1)
+        self.assertEqual(
+            conn.execute("SELECT what_this_was FROM session_cards").fetchone()[0],
+            "Rewrote the payout retry.",
+        )
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 1)
+        conn.close()
+
+    def test_dashboard_asks_for_a_bounded_number_of_rebuilds(self):
+        conn = make_conn_with_docs(
+            [
+                doc(doc_id=f"d{i}", session_id=f"s{i}", title=f"S{i}", text=f"Work {i}.", ts=i)
+                for i in range(12)
+            ]
+        )
+        results = ss.recent_session_results(conn, 12)
+        with mock.patch.object(ss, "catch_up_dashboard_cards", return_value=0) as catch_up:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ss.print_dashboard(conn, results)
+        catch_up.assert_called_once()
+        limit = catch_up.call_args.kwargs.get("limit")
+        self.assertIsNotNone(limit, "the dashboard must pass an explicit rebuild bound")
+        # An unbounded dashboard open is a paid fan-out over every visible row.
+        self.assertGreaterEqual(limit, 1)
+        self.assertLessEqual(limit, 10)
+        conn.close()
+
+    def test_catch_up_counts_each_session_once(self):
+        conn = make_conn_with_docs(
+            [
+                doc(doc_id="d1", session_id="s1", text="First turn.", ts=1),
+                doc(doc_id="d2", session_id="s1", text="Second turn.", ts=2),
+            ]
+        )
+        results = ss.recent_session_results(conn, 10)
+        duplicated = [*results, *results]
+        with mock.patch.object(ss, "llm_summarize", return_value="Rebuilt it."):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                built = ss.catch_up_dashboard_cards(conn, duplicated, limit=10)
+        self.assertEqual(built, 1)
+        conn.close()
+
+    def test_a_query_result_costs_no_model_calls_beyond_the_base_card(self):
+        conn = make_conn_with_docs(
+            [doc(doc_id="d1", session_id="s1", text="Rebuilt the billing exporter.", ts=1)]
+        )
+        row = conn.execute("SELECT * FROM documents WHERE doc_id = 'd1'").fetchone()
+        with mock.patch.object(ss, "llm_summarize", return_value="Rebuilt the billing exporter.") as llm:
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                ss.session_card_for_result(conn, row, "billing", persist=True)
+                first = llm.call_count
+                self.assertEqual(first, 2, "base card should cost exactly one About and one Next call")
+                card = ss.session_card_for_result(conn, row, "billing", persist=True)
+                self.assertEqual(llm.call_count, first, "a warm query result must cost nothing")
+                ss.session_card_for_result(conn, row, "exporter", persist=False)
+                self.assertEqual(llm.call_count, first, "ss show must not re-pay per invocation")
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_LLM)
+        self.assertEqual(card.what_this_was, "Rebuilt the billing exporter.")
+        conn.close()
+
+    def test_a_query_result_keeps_query_specific_evidence(self):
+        conn = make_conn_with_docs(
+            [
+                doc(doc_id="d1", session_id="s1", text="Rebuilt the billing exporter.", ts=1),
+                doc(doc_id="d2", session_id="s1", text="Next I need to fix the payout retry.", ts=2),
+            ]
+        )
+        row = conn.execute("SELECT * FROM documents WHERE doc_id = 'd1'").fetchone()
+        with mock.patch.object(ss, "llm_summarize", return_value=""):
+            with mock.patch.object(ss, "llm_available", return_value=False):
+                card = ss.session_card_for_result(conn, row, "payout retry", persist=False)
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_EVIDENCE)
+        self.assertTrue(card.evidence)
+        conn.close()
+
+    def test_dashboard_never_shows_raw_evidence_as_about(self):
+        rows = [
+            make_row(
+                doc_id="only",
+                title="Osmo x402: curriculum import",
+                text="i asked you to reopen",
+                ts=100,
+            ),
+        ]
+        card = ss.SessionCard(
+            title="22/07/26 12:14:46 — Osmo x402: curriculum import",
+            source="codex",
+            session_id="osmo",
+            repo="/Users/alex/projects",
+            last_active=100,
+            last_user_message=rows[-1]["text"],
+            # An uncached card carries the raw evidence line here.
+            what_this_was="i asked you to reopen",
+            what_happened="",
+            next_clue="",
+            mentioned_paths=(),
+            evidence=(),
+            summary_source=ss.SUMMARY_SOURCE_EVIDENCE,
+        )
+        about, _state, _resume, _clue = ss.dashboard_summary(card, rows, rows[-1])
+        self.assertEqual(about, "Osmo x402.")
+        self.assertNotIn("asked you to reopen", about)
+
+    def test_catch_up_rebuilds_an_evidence_card_when_a_key_exists(self):
+        conn = make_conn_with_docs([doc(doc_id="d1", session_id="s1", text="Rebuilt it.", ts=1)])
+        results = ss.recent_session_results(conn, 1)
+        with mock.patch.object(ss, "llm_summarize", return_value=""):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                self.assertEqual(ss.catch_up_dashboard_cards(conn, results), 1)
+        self.assertEqual(
+            conn.execute("SELECT summary_source FROM session_cards").fetchone()[0],
+            ss.SUMMARY_SOURCE_EVIDENCE,
+        )
+        with mock.patch.object(ss, "llm_summarize", return_value="Rebuilt the ATS collector."):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                self.assertEqual(ss.catch_up_dashboard_cards(conn, results), 1)
+        row = conn.execute("SELECT summary_source, what_this_was FROM session_cards").fetchone()
+        self.assertEqual(row[0], ss.SUMMARY_SOURCE_LLM)
+        self.assertEqual(row[1], "Rebuilt the ATS collector.")
+        conn.close()
+
+    def test_catch_up_does_not_retry_evidence_cards_without_a_key(self):
+        conn = make_conn_with_docs([doc(doc_id="d1", session_id="s1", text="Rebuilt it.", ts=1)])
+        results = ss.recent_session_results(conn, 1)
+        with mock.patch.object(ss, "llm_available", return_value=False):
+            with mock.patch.object(ss, "llm_summarize", return_value="") as llm:
+                ss.catch_up_dashboard_cards(conn, results)
+                first_calls = llm.call_count
+                self.assertEqual(ss.catch_up_dashboard_cards(conn, results), 0)
+                self.assertEqual(llm.call_count, first_calls)
+        conn.close()
+
+    def test_missing_api_key_is_reported_once_not_silently_swallowed(self):
+        conn = make_conn_with_docs([doc(doc_id="d1", session_id="s1", text="Rebuilt it.", ts=1)])
+        results = ss.recent_session_results(conn, 1)
+        stderr = io.StringIO()
+        with mock.patch.object(ss, "llm_available", return_value=False):
+            with mock.patch.object(ss, "_LLM_WARNED", False):
+                with contextlib.redirect_stderr(stderr):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        ss.catch_up_dashboard_cards(conn, results, quiet=False)
+                        ss.catch_up_dashboard_cards(conn, results, quiet=False)
+        self.assertEqual(stderr.getvalue().count("OPENROUTER_API_KEY"), 1)
+        conn.close()
+
+    def test_card_records_llm_provenance_when_the_model_answers(self):
+        rows = [make_row(doc_id="d1", title="Two answers", text="Rebuilt the collector.", ts=1)]
+        with mock.patch.object(ss, "llm_summarize", return_value="Rebuilt the ATS collector end to end."):
+            card = ss.build_session_card(rows, rows[0], "", use_llm=True)
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_LLM)
+
+    def test_card_records_evidence_provenance_when_the_model_fails(self):
+        rows = [make_row(doc_id="d1", title="Two answers", text="Rebuilt the collector.", ts=1)]
+        with mock.patch.object(ss, "llm_summarize", return_value=""):
+            card = ss.build_session_card(rows, rows[0], "", use_llm=True)
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_EVIDENCE)
+
+    def test_card_records_evidence_when_only_the_next_leg_answers(self):
+        rows = [make_row(doc_id="d1", title="Two answers", text="Rebuilt the collector.", ts=1)]
+
+        def summarize(prompt: str, max_tokens: int = 220) -> str:
+            return "" if prompt.startswith("Summarize what this session was about") else "Ship it."
+
+        with mock.patch.object(ss, "llm_summarize", side_effect=summarize):
+            card = ss.build_session_card(rows, rows[0], "", use_llm=True)
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_EVIDENCE)
+        self.assertEqual(card.next_clue, "Ship it.")
+
+    def test_card_without_llm_is_never_marked_llm(self):
+        rows = [make_row(doc_id="d1", title="Two answers", text="Rebuilt the collector.", ts=1)]
+        card = ss.build_session_card(rows, rows[0], "", use_llm=False)
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_EVIDENCE)
+
+    def test_provenance_survives_the_card_cache_round_trip(self):
+        conn = make_conn_with_docs([doc(doc_id="d1", session_id="s1", text="Rebuilt it.", ts=1)])
+        row = conn.execute("SELECT * FROM documents WHERE doc_id = 'd1'").fetchone()
+        rows = ss.session_rows(conn, row)
+        with mock.patch.object(ss, "llm_summarize", return_value="Rebuilt the ATS collector."):
+            card = ss.build_session_card(rows, row, "", use_llm=True)
+        with conn:
+            ss.store_session_card(conn, card, ss.session_card_hash(rows))
+        cached = conn.execute("SELECT * FROM session_cards").fetchone()
+        self.assertEqual(ss.card_from_cache_row(cached).summary_source, ss.SUMMARY_SOURCE_LLM)
+        conn.close()
+
+    def test_document_title_prefers_session_fallback_over_untitled(self):
+        title = ss.document_title_with_fallback(
+            "", "I need you to fix the thing.\nraw-only-secret", "Northstar deploy review"
+        )
+        self.assertEqual(title, "Northstar deploy review")
+
+    def test_document_title_ignores_machine_fallback(self):
+        title = ss.document_title_with_fallback(
+            "", "I need you to fix the thing.\nraw-only-secret", "0f9c2b1a4d5e6f708192a3b4"
+        )
+        self.assertEqual(title, "(untitled session)")
+        self.assertNotIn("raw-only-secret", title)
+
+    def test_card_about_line_keeps_first_sentence_without_ellipsis(self):
+        long_about = (
+            "This session focused on transitioning the Lakeside Clinic cash lead-generation strategy "
+            "into a repeatable corpus-backed pipeline that produces landing pages, story pools, "
+            "and angle libraries without hand-written copy for every single campaign variant. "
+            "A second sentence that must be dropped."
+        )
+        line = ss.card_about_line(long_about)
+        self.assertFalse(line.endswith("..."))
+        self.assertNotIn("second sentence", line.lower())
+        self.assertTrue(line.startswith("This session focused on transitioning"))
+        self.assertNotEqual(clean_card_field(line, 180), "")
+
+    def test_card_about_line_does_not_split_on_abbreviations(self):
+        # Each input is ONE sentence containing an internal period. The whole
+        # sentence must survive, including the words after the abbreviation,
+        # otherwise the split happened where it must not.
+        cases = {
+            "Dr. Smith fixed the reminder pipeline and shipped it to production today.":
+                "production today",
+            "Rewrote the collector, e.g. the ATS feed, so it retries failed pages cleanly.":
+                "retries failed pages cleanly",
+            "The scraping lane was rebuilt to compare Camoufox vs. Playwright end to end.":
+                "end to end",
+            "A long enough clause about the exporter and Dr. Smith who signed it off.":
+                "who signed it off",
+        }
+        for text, tail in cases.items():
+            line = ss.card_about_line(text)
+            self.assertIn(tail, line, f"abbreviation split dropped the tail: {line!r}")
+            self.assertEqual(line, text, f"sentence was altered: {line!r}")
+            self.assertNotEqual(clean_card_field(line, 180), "")
+
+    def test_prompt_echo_never_becomes_the_summary(self):
+        echoed = (
+            "Summarize what this session was about in exactly 1 sentence. "
+            "The user debugged the ATS collector and fixed the Greenhouse 403s."
+        )
+        rows = [make_row(doc_id="d1", title="Two answers", text="Debugged the collector.", ts=1)]
+        with mock.patch.object(ss, "llm_summarize", return_value=echoed):
+            card = ss.build_session_card(rows, rows[0], "", use_llm=True)
+        self.assertIn("Greenhouse", card.what_this_was)
+        self.assertNotIn("exactly 1 sentence", card.what_this_was)
+        self.assertEqual(card.summary_source, ss.SUMMARY_SOURCE_LLM)
+
+    def test_a_real_summary_about_summaries_is_not_stripped(self):
+        # The obvious over-strip: a session whose actual topic is summarization
+        # shares most of its vocabulary with the instruction.
+        for answer in (
+            "This session rewrote the summary prompt so each session card gets exactly one sentence.",
+            "The session was about ignoring shell prompts in the summary pipeline.",
+        ):
+            line = ss.card_about_line(ss.strip_prompt_echo(answer, ss.ABOUT_INSTRUCTION))
+            self.assertNotEqual(line, "", f"a real summary was stripped: {answer!r}")
+            self.assertIn("session", line.lower())
+
+    def test_card_about_line_skips_a_trivial_leading_sentence(self):
+        # A model that opens with an acknowledgement must not have that become
+        # the whole summary. The length floor, not the abbreviation rule, is
+        # what rejects these heads.
+        for text, wanted in (
+            ("Done. The session rebuilt the billing exporter end to end.", "billing exporter"),
+            ("Sure. The collector now retries Greenhouse pages that return 403.", "Greenhouse"),
+        ):
+            line = ss.card_about_line(text)
+            self.assertIn(wanted, line, f"summary collapsed to the opener: {line!r}")
+
+    def test_card_about_line_repairs_both_ellipsis_forms(self):
+        for tail in ("...", "…", " ...", "…  "):
+            text = "Rebuilt the ATS collector so Greenhouse stops returning 403" + tail
+            line = ss.card_about_line(text)
+            self.assertNotEqual(
+                clean_card_field(line, 180), "", f"gate rejected the {tail!r} form: {line!r}"
+            )
+            self.assertIn("Greenhouse", line)
+
+    def test_truncation_is_defined_in_exactly_one_place(self):
+        import card_quality
+
+        self.assertIs(ss.TRUNCATED_RE, card_quality.TRUNCATED_RE)
+
+    def test_card_about_line_rejects_content_free_answers(self):
+        for text in ("…", "...", "  ", "---"):
+            self.assertEqual(ss.card_about_line(text), "")
+
+    def test_card_about_line_survives_a_single_overlong_sentence(self):
+        overlong = "This session " + ("rebuilt the cached summary pipeline " * 20) + "end."
+        line = ss.card_about_line(overlong)
+        self.assertFalse(line.endswith("..."))
+        self.assertNotEqual(clean_card_field(line, 180), "")
+
+    def test_dashboard_about_falls_back_to_title_without_cached_summary(self):
+        rows = [
+            make_row(
+                doc_id="only",
+                title="Osmo x402: curriculum import",
+                text="Osmo x402: the curriculum import was decided.",
+                ts=100,
+            ),
+        ]
+        card = ss.SessionCard(
+            title="22/07/26 12:14:46 — Osmo x402: curriculum import",
+            source="codex",
+            session_id="osmo",
+            repo="/Users/alex/projects",
+            last_active=100,
+            last_user_message=rows[-1]["text"],
+            what_this_was="",
+            what_happened="",
+            next_clue="",
+            mentioned_paths=(),
+            evidence=(),
+        )
+        about, _state, _resume, _clue = ss.dashboard_summary(card, rows, rows[-1])
+        self.assertEqual(about, "Osmo x402.")
 
     def test_dashboard_prompt_opens_selected_session(self):
         args = ss.argparse.Namespace(db=":memory:", limit=10, source="all", mode="hybrid")

@@ -19,6 +19,7 @@ class AdapterCapability:
 _CAPABILITIES = (
     AdapterCapability("claude", "Claude Code", True, "full", "full", True, True),
     AdapterCapability("codex", "Codex", True, "full", "partial", True, True),
+    AdapterCapability("pi", "Pi", True, "full", "full", True, True),
     AdapterCapability("vscode", "VS Code/Copilot", True, "partial", "partial", False, True),
     AdapterCapability("cursor", "Cursor", True, "partial", "partial", False, True),
 )

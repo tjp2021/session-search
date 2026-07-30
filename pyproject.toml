@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "session-search"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local search and recovery across AI coding sessions"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,6 +46,7 @@ py-modules = [
   "public_corpus",
   "retrieval_eval",
   "schema_migrations",
+  "secret_patterns",
   "session_search",
   "ss_config",
 ]

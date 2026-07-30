@@ -21,8 +21,8 @@ import math
 import os
 import pathlib
 import re
-import shlex
 import shutil
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -33,7 +33,8 @@ from archive_intent import PARSER_VERSION as ARCHIVE_INTENT_VERSION
 from archive_intent import IntentKind, classify_session_intent, has_session_intent_candidate
 from archive_store import StorageFailure, backup_database, immediate_transaction, quick_check
 from adapter_capabilities import render_capabilities
-from card_quality import quality_gate
+from card_quality import TRUNCATED_RE, quality_gate
+from secret_patterns import redact as redact_secrets
 from platform_lock import LockTimeout, UnsupportedPlatform, file_lock
 from schema_migrations import (
     CURRENT_SCHEMA_VERSION,
@@ -56,7 +57,23 @@ DEFAULT_MODEL_CACHE = str(_DEFAULT_PATHS.model_cache)
 DEFAULT_EVALS = pathlib.Path(__file__).resolve().with_name("evals") / "session-search-evals.json"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_MODEL_VERSION = "fastembed:" + EMBED_MODEL
-CARD_VERSION = "local-card-v10"
+CARD_VERSION = "openrouter-card-v18"
+UNTITLED_SESSION = "(untitled session)"
+# Where a card's About text came from. An `evidence` card is a regex fallback
+# built when the model was unavailable, and it is rebuilt once a key works.
+SUMMARY_SOURCE_LLM = "llm"
+SUMMARY_SOURCE_EVIDENCE = "evidence"
+# Every adapter SS can index, and the subset whose native app can reopen a
+# session exactly. The CLI choices and the capability matrix both derive from
+# these, so a new adapter cannot be half-registered.
+SUPPORTED_SOURCES = ("codex", "claude", "pi", "vscode", "cursor")
+NATIVE_REOPEN_SOURCES = ("codex", "claude", "pi")
+SOURCE_CHOICES = ("all", *SUPPORTED_SOURCES)
+# How far back routine backfill will summarize. The dashboard asks for
+# max(limit, 50) sessions, so this stays above that. Older sessions are
+# summarized on demand when a search surfaces them, and then cached, so their
+# text is sent once instead of never being read.
+CARD_BACKFILL_SESSIONS = 60
 EMBED_TEXT_CHARS = 5000
 MAX_DOC_CHARS = 16000
 CHUNK_OVERLAP = 800
@@ -291,6 +308,7 @@ class SessionCard:
     next_clue: str
     mentioned_paths: tuple[str, ...]
     evidence: tuple[EvidenceLine, ...]
+    summary_source: str = "evidence"
 
 
 def expand(path: str | pathlib.Path) -> pathlib.Path:
@@ -418,10 +436,31 @@ def connect_db(db_path: pathlib.Path) -> sqlite3.Connection:
     return conn
 
 
+_LOCK_DEPTH = 0
+
+
 @contextlib.contextmanager
 def session_lock(shared: bool = False) -> Iterator[None]:
+    """Process-wide advisory lock, reentrant within this process.
+
+    Reentrancy lets a long build take the lock per write while still working
+    when an outer command already holds it. Without it the inner acquire waits
+    on a lock this same process owns and fails after the timeout.
+    """
+    global _LOCK_DEPTH
+    if _LOCK_DEPTH > 0:
+        _LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH -= 1
+        return
     with file_lock(expand(DEFAULT_LOCK), shared=shared):
-        yield
+        _LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH -= 1
 
 
 def connect_ro_sqlite(path: pathlib.Path) -> sqlite3.Connection | None:
@@ -502,6 +541,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_session_embeddings_model
             ON session_embeddings(model);
 
+        DROP TABLE IF EXISTS session_cards;
+
         CREATE TABLE IF NOT EXISTS session_cards (
             source TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -514,6 +555,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             next_clue TEXT NOT NULL,
             mentioned_paths_json TEXT NOT NULL,
             evidence_json TEXT NOT NULL,
+            summary_source TEXT NOT NULL DEFAULT 'evidence',
             built_at INTEGER NOT NULL,
             PRIMARY KEY (source, session_id)
         );
@@ -573,6 +615,12 @@ def reset_db(conn: sqlite3.Connection) -> None:
         """
         DROP TABLE IF EXISTS documents;
         DROP TABLE IF EXISTS documents_fts;
+        DROP TABLE IF EXISTS documents_fts_data;
+        DROP TABLE IF EXISTS documents_fts_idx;
+        DROP TABLE IF EXISTS documents_fts_content;
+        DROP TABLE IF EXISTS documents_fts_docsize;
+        DROP TABLE IF EXISTS documents_fts_config;
+        PRAGMA user_version = 0;
         """
     )
     init_db(conn)
@@ -718,7 +766,7 @@ def iter_codex_threads(home: pathlib.Path) -> Iterator[Document]:
                 doc_id=f"codex-thread:{session_id}",
                 source="codex",
                 session_id=session_id,
-                title=title or text[:120],
+                title=derive_document_title(title, text),
                 path=str(db),
                 cwd=sanitize_text(row["cwd"] or ""),
                 role="session",
@@ -764,7 +812,7 @@ def iter_codex_history(
                 doc_id=f"codex-history:{session_id}:{ts or line_no}:{stable_hash(text)}",
                 source="codex",
                 session_id=session_id,
-                title=text[:120],
+                title=derive_document_title("", text),
                 path=str(path),
                 cwd=sanitize_text(context.get("cwd", "")),
                 role="user",
@@ -836,7 +884,7 @@ def iter_claude_jsonl(path: pathlib.Path, source: str) -> Iterator[Document]:
 
     fallback_title = title or session_id
     for doc in docs:
-        yield dataclasses.replace(doc, title=doc.title or fallback_title)
+        yield dataclasses.replace(doc, title=document_title_with_fallback(doc.title, doc.text, fallback_title))
 
 
 def extract_claude_turn(obj: dict[str, Any]) -> tuple[str, str]:
@@ -860,6 +908,200 @@ def extract_claude_turn(obj: dict[str, Any]) -> tuple[str, str]:
     if isinstance(message, str):
         return role, sanitize_text(message)
     return "", ""
+
+
+def iter_pi(home: pathlib.Path) -> Iterator[Document]:
+    sessions_dir = home / ".pi" / "agent" / "sessions"
+    if not sessions_dir.exists():
+        return
+    pattern = str(sessions_dir / "*" / "*.jsonl")
+    for file_path in glob.iglob(pattern, recursive=False):
+        yield from iter_pi_jsonl(pathlib.Path(file_path))
+
+
+def iter_pi_jsonl(path: pathlib.Path) -> Iterator[Document]:
+    """Index the active branch of a Pi session tree.
+
+    Pi sessions are JSONL trees (id/parentId). SS only indexes the path from the
+    current leaf back to the root so abandoned forks are not double-counted.
+    """
+    header: dict[str, Any] | None = None
+    entries: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line_no, line in enumerate(handle, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            obj_type = str(obj.get("type") or "")
+            if obj_type == "session":
+                header = obj
+                continue
+            if "id" not in obj:
+                continue
+            obj["_line_no"] = line_no
+            entries.append(obj)
+
+    if not entries and header is None:
+        return
+
+    session_id = ""
+    if header and header.get("id"):
+        session_id = str(header["id"])
+    if not session_id:
+        # Fallback: filename stem is "<timestamp>_<uuid>".
+        stem = path.stem
+        session_id = stem.split("_", 1)[-1] if "_" in stem else stem
+
+    cwd = sanitize_text((header or {}).get("cwd") or "")
+    title = pi_session_name(entries) or session_id
+    active_entries = pi_active_branch_entries(entries)
+
+    docs: list[Document] = []
+    for entry in active_entries:
+        role, text = extract_pi_entry_text(entry)
+        if not text:
+            continue
+        entry_id = str(entry.get("id") or entry.get("_line_no") or len(docs))
+        ts = parse_ts(entry.get("timestamp"))
+        if ts is None:
+            message = entry.get("message")
+            if isinstance(message, dict):
+                ts = parse_ts(message.get("timestamp"))
+        docs.append(
+            Document(
+                doc_id=f"pi:{session_id}:{entry_id}",
+                source="pi",
+                session_id=session_id,
+                title=title,
+                path=str(path),
+                cwd=cwd,
+                role=role,
+                ts=ts,
+                text=text,
+                meta={
+                    "line": entry.get("_line_no"),
+                    "entry_type": entry.get("type", ""),
+                    "parent_id": entry.get("parentId"),
+                    "leaf_id": active_entries[-1].get("id") if active_entries else "",
+                },
+            )
+        )
+
+    for doc in docs:
+        yield dataclasses.replace(doc, title=document_title_with_fallback(doc.title, doc.text, title))
+
+
+def pi_session_name(entries: list[dict[str, Any]]) -> str:
+    name = ""
+    for entry in entries:
+        if entry.get("type") != "session_info":
+            continue
+        candidate = sanitize_text(entry.get("name") or "")
+        if candidate:
+            name = candidate
+    return name
+
+
+def pi_active_branch_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return root→leaf entries for the current Pi leaf.
+
+    The leaf is any entry whose id is never referenced as a parentId. If the
+    tree has multiple tips (concurrent forks that were not pruned), prefer the
+    newest timestamp so abandoned older forks stay out of the active branch.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    referenced_as_parent: set[str] = set()
+    for entry in entries:
+        entry_id = str(entry.get("id") or "")
+        if not entry_id:
+            continue
+        by_id[entry_id] = entry
+        parent_id = entry.get("parentId")
+        if parent_id is not None and parent_id != "":
+            referenced_as_parent.add(str(parent_id))
+
+    if not by_id:
+        return []
+
+    tips = [entry for entry_id, entry in by_id.items() if entry_id not in referenced_as_parent]
+    if not tips:
+        # Cycles or missing links: fall back to newest entry by timestamp/order.
+        tips = list(by_id.values())
+
+    def tip_sort_key(entry: dict[str, Any]) -> tuple[int, int]:
+        ts = parse_ts(entry.get("timestamp")) or 0
+        line_no = int(entry.get("_line_no") or 0)
+        return ts, line_no
+
+    leaf = max(tips, key=tip_sort_key)
+    path: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current: dict[str, Any] | None = leaf
+    while current is not None:
+        entry_id = str(current.get("id") or "")
+        if not entry_id or entry_id in seen:
+            break
+        seen.add(entry_id)
+        path.append(current)
+        parent_id = current.get("parentId")
+        if parent_id is None or parent_id == "":
+            break
+        current = by_id.get(str(parent_id))
+    path.reverse()
+    return path
+
+
+def extract_pi_entry_text(entry: dict[str, Any]) -> tuple[str, str]:
+    entry_type = str(entry.get("type") or "")
+    if entry_type == "message":
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            return "", ""
+        role = str(message.get("role") or "").strip()
+        if role in {"toolResult", "tool_result", "bashExecution"}:
+            return "", ""
+        if role == "user":
+            return "user", extract_pi_content_text(message.get("content"))
+        if role == "assistant":
+            return "assistant", extract_pi_content_text(message.get("content"))
+        if role in {"branchSummary", "compactionSummary", "custom"}:
+            return "assistant", extract_pi_content_text(message.get("content") or message.get("summary"))
+        return "", ""
+    if entry_type == "compaction":
+        return "assistant", sanitize_text(entry.get("summary") or "")
+    if entry_type == "branch_summary":
+        return "assistant", sanitize_text(entry.get("summary") or "")
+    if entry_type == "custom_message":
+        return "user", extract_pi_content_text(entry.get("content"))
+    return "", ""
+
+
+def extract_pi_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return sanitize_text(content)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if item_type in {"image", "toolcall", "tool_use", "tool_result", "thinking"}:
+                continue
+            if "text" in item:
+                parts.append(str(item["text"]))
+            elif "thinking" in item and item_type == "":
+                parts.append(str(item["thinking"]))
+        return sanitize_text("\n\n".join(parts))
+    return ""
 
 
 def extract_content_text(content: Any) -> str:
@@ -968,7 +1210,7 @@ def iter_vscode_state_db(path: pathlib.Path, source: str) -> Iterator[Document]:
                         doc_id=f"{source}-state:{session_id}:{i}:{stable_hash(text)}",
                         source=source,
                         session_id=session_id,
-                        title=title,
+                        title=derive_document_title(title, text),
                         path=str(path),
                         cwd="",
                         role="state",
@@ -996,7 +1238,7 @@ def iter_json_session_file(path: pathlib.Path, source: str) -> Iterator[Document
             doc_id=f"{source}-json:{session_id}:{i}:{stable_hash(text)}",
             source=source,
             session_id=session_id,
-            title=session_id,
+            title=derive_document_title(session_id, text),
             path=str(path),
             cwd="",
             role="session",
@@ -1210,6 +1452,8 @@ def build_docs(home: pathlib.Path, sources: set[str]) -> Iterator[Document]:
         yield from iter_codex(home)
     if "claude" in sources:
         yield from iter_claude(home)
+    if "pi" in sources:
+        yield from iter_pi(home)
     if "vscode" in sources:
         yield from iter_vscode(home)
     if "cursor" in sources:
@@ -1263,7 +1507,7 @@ def refresh_dashboard_index(conn: sqlite3.Connection, home: pathlib.Path) -> int
 
 def normalize_sources(raw: str) -> set[str]:
     if raw == "all":
-        return {"codex", "claude", "vscode", "cursor"}
+        return set(SUPPORTED_SOURCES)
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 
@@ -1519,7 +1763,7 @@ def ensure_session_embeddings(conn: sqlite3.Connection, limit: int | None = None
         return 0
 
     pending: list[tuple[str, str, str, str]] = []
-    for source, session_id in session_groups(conn, limit=None):
+    for source, session_id in session_groups(conn, limit=CARD_BACKFILL_SESSIONS):
         rows = rows_for_session(conn, source, session_id)
         text = session_embedding_text(rows)
         if not text:
@@ -1768,6 +2012,7 @@ def infer_source_from_query(query: str, explicit_source: str) -> tuple[str, str]
     leading_sources = [
         ("claude", r"^\s*(?:claude(?:\s+code)?|cc)\b"),
         ("codex", r"^\s*codex\b"),
+        ("pi", r"^\s*pi\b"),
         ("vscode", r"^\s*(?:github\s+copilot|copilot|vscode|vs\s+code)\b"),
         ("cursor", r"^\s*cursor\b"),
     ]
@@ -1780,6 +2025,7 @@ def infer_source_from_query(query: str, explicit_source: str) -> tuple[str, str]
     patterns = [
         ("claude", r"\b(?:in|from|only)\s+claude(?:\s+code)?\b|\bclaude\s+code\s+session\b"),
         ("codex", r"\b(?:in|from|only)\s+codex\b|\bcodex\s+session\b"),
+        ("pi", r"\b(?:in|from|only)\s+pi\b|\bpi\s+session\b"),
         (
             "vscode",
             r"\b(?:in|from|only)\s+(?:vscode|vs\s+code|copilot|github\s+copilot)\b|"
@@ -2156,6 +2402,7 @@ def source_label(source: str) -> str:
     return {
         "claude": "Claude Code",
         "codex": "Codex",
+        "pi": "Pi",
         "vscode": "VS Code / Copilot",
         "cursor": "Cursor",
     }.get(source, source)
@@ -2172,6 +2419,8 @@ def is_machine_title(title: str) -> bool:
     return bool(re.fullmatch(r"[a-f0-9-]{24,}", title.strip(), flags=re.I))
 
 
+PROMPT_STARTER_RE = re.compile(r"^(?:i\s+need\s+(?:you\s+)?(?:to|can|help)|can\s+you\s+(?:please)?|please\s+|help me|analyze the current|resume the session we|I need to resume|find the fucking|this is what we were working on|Stop\.?|okay\.?)", re.I)
+
 def is_weak_title(title: str) -> bool:
     title = sanitize_text(title)
     if not title or is_machine_title(title):
@@ -2180,16 +2429,157 @@ def is_weak_title(title: str) -> bool:
         return True
     if title.lower() in {"ls", "pwd", "cd", "git status", "status"}:
         return True
+    if PROMPT_STARTER_RE.search(title):
+        return True
+    if len(title.split()) > 12 and any(
+        word in title.lower() for word in ("need", "you to", "help me", "analyze", "resume the", "fucking")
+    ):
+        return True
     return len(tokenize(title)) <= 1 and len(title) < 12
+
+
+def synthesize_resume_from_text(text: str) -> str:
+    """Attempts to synthesize a meaningful resume/next-action from raw session text using an LLM."""
+    cleaned_text = sanitize_text(text)
+    truncated_text = cleaned_text[:4000]
+    prompt = f"Summarize the next action or resume point from this session text in 1 sentence: {truncated_text}"
+    summary = llm_summarize(prompt, max_tokens=120)
+    if summary:
+        return clean_card_line(summary, 260)
+    return ""
+
+
+def derive_document_title(original_title: str, full_text: str) -> str:
+    """Derives a suitable Document title, prioritizing original if strong, else a simple fallback.
+
+    LLM title synthesis is intentionally NOT done here (indexing is bulk).
+    It runs later in build_session_card / synthesize_title_from_text on demand.
+    """
+    if original_title and not is_weak_title(original_title):
+        return clean_card_line(original_title, 110)
+    # Simple non-LLM fallback: only the FIRST meaningful line may become a title.
+    # Scanning deeper leaks arbitrary transcript content into the session name.
+    cleaned = sanitize_text(full_text)
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if is_weak_title(line):
+            break
+        return clean_card_line(line, 110)
+    return UNTITLED_SESSION
+
+
+def document_title_with_fallback(original_title: str, full_text: str, fallback: str) -> str:
+    """Use the owning session's own title when no safe title can be derived.
+
+    derive_document_title() returns the UNTITLED_SESSION sentinel, which is
+    truthy, so call sites cannot fall back with a plain `or`.
+    """
+    derived = derive_document_title(original_title, full_text)
+    if derived and derived != UNTITLED_SESSION:
+        return derived
+    candidate = sanitize_text(fallback)
+    if candidate and not is_weak_title(candidate):
+        return clean_card_line(candidate, 110)
+    return UNTITLED_SESSION
+
+
+def _load_openrouter_api_key() -> str:
+    """Read OPENROUTER_API_KEY from the environment only, never logging it.
+
+    No config-file fallback: a public package must not read another
+    product's dotfiles for a credential.
+    """
+    return os.environ.get("OPENROUTER_API_KEY", "").strip()
+
+
+def summaries_enabled() -> bool:
+    """True only when the user opted this tool into model summaries.
+
+    A key in the environment is not consent; plenty of unrelated tools use
+    OPENROUTER_API_KEY. SS_SUMMARIES=openrouter is the explicit switch.
+    """
+    return os.environ.get("SS_SUMMARIES", "").strip().lower() == "openrouter"
+
+
+_LLM_WARNED = False
+
+
+def llm_available() -> bool:
+    """True when the user opted in and a key is present."""
+    return summaries_enabled() and bool(_load_openrouter_api_key())
+
+
+def warn_llm_unavailable() -> None:
+    """Say once why summaries are degraded. Silent degradation is a bug."""
+    global _LLM_WARNED
+    if _LLM_WARNED:
+        return
+    _LLM_WARNED = True
+    print(
+        "Model summaries are off, so session cards fall back to local evidence "
+        "lines. To turn them on, set SS_SUMMARIES=openrouter and OPENROUTER_API_KEY. "
+        "Cards are rebuilt automatically once both are set.",
+        file=sys.stderr,
+    )
+
+
+def llm_summarize(prompt: str, max_tokens: int = 220) -> str:
+    """Call OpenRouter chat completions (gpt-4.1-nano) to summarize the given text.
+
+    Returns an empty string on any failure so callers fall back to regex heuristics.
+    """
+    if not llm_available():
+        return ""
+    import requests
+
+    api_key = _load_openrouter_api_key()
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "openai/gpt-4.1-nano",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return str(message.get("content", "")).strip()
+    except Exception as e:
+        print(f"OpenRouter summarize error: {e}", file=sys.stderr)
+        return ""
+
+
+# Back-compat alias: older call sites referenced ollama_summarize().
+ollama_summarize = llm_summarize
+
+def synthesize_title_from_text(text: str) -> str:
+    """Attempts to synthesize a meaningful title from raw session text using an LLM."""
+    cleaned_text = sanitize_text(text)
+    truncated_text = cleaned_text[:4000]
+    prompt = f"Summarize this session text in 1 sentence for a title: {truncated_text}"
+    summary = llm_summarize(prompt, max_tokens=80)
+    if summary:
+        return clean_card_line(summary, 110)
+    return UNTITLED_SESSION
 
 
 def candidate_title(row: sqlite3.Row) -> str:
     title = sanitize_text(row["title"] or "")
-    if title and not is_weak_title(title):
-        return clean_card_line(title, 110)
     text = sanitize_text(row["text"] or "")
-    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    return clean_card_line(first_line, 110) or "(untitled session)"
+    return derive_document_title(title, text)
 
 
 def row_meta(row: sqlite3.Row) -> dict[str, Any]:
@@ -2217,7 +2607,7 @@ def session_rows(conn: sqlite3.Connection, row: sqlite3.Row) -> list[sqlite3.Row
 
 def best_session_title(rows: list[sqlite3.Row], fallback: sqlite3.Row) -> str:
     fallback_title = candidate_title(fallback)
-    if fallback_title and fallback_title != "(untitled session)":
+    if fallback_title and fallback_title != UNTITLED_SESSION:
         return fallback_title
     for row in rows:
         title = sanitize_text(row["title"] or "")
@@ -2273,19 +2663,6 @@ def full_user_message_text(row: sqlite3.Row) -> str:
         return ""
     if INJECTED_USER_MESSAGE_RE.match(text):
         return ""
-    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    if re.match(r"^(?:[\w.-]+@[\w.-]+|\$\s|#\s)", first):
-        return ""
-    if "% ss" in first.lower() or ("@" in first and re.search(r"\bss\b", first)):
-        return ""
-    if re.fullmatch(r"(?:stop|ok|okay|yes|no|thanks|continue|sure|cool|great|wait)\.?", first, flags=re.I):
-        return ""
-    if first.startswith(("<command-", "<local-command", "Open a number, type search words")):
-        return ""
-    if first.startswith(">") and len(first) < 80:
-        return ""
-    if first.lower().startswith(("exit codex", "exit claude")):
-        return ""
     return text
 
 
@@ -2309,7 +2686,7 @@ def last_user_message(rows: list[sqlite3.Row], fallback: sqlite3.Row) -> str:
 def recent_user_messages(
     rows: list[sqlite3.Row],
     fallback: sqlite3.Row,
-    limit: int = 6,
+    limit: int = 3,
 ) -> list[str]:
     messages: list[str] = []
     seen: set[str] = set()
@@ -2728,7 +3105,125 @@ def _strip_card_prefixes(text: str) -> str:
     ).strip()
 
 
+def dashboard_terminal_width() -> int:
+    try:
+        width = int(shutil.get_terminal_size(fallback=(100, 24)).columns)
+    except (TypeError, ValueError, OSError):
+        width = 100
+    return max(60, min(width, 200))
+
+
+def dashboard_clean_text(value: str) -> str:
+    """Strip control junk that makes terminal paste unreadable.
+
+    Do not use sanitize_text() here: it line-strips and would destroy the
+    intentional left indentation of dashboard rows.
+    """
+    if value is None:
+        clean = ""
+    elif isinstance(value, str):
+        clean = value
+    else:
+        clean = str(value)
+    clean = re.sub(r"\[[0-9;?]*[A-Za-z]", " ", clean)
+    clean = re.sub(r"\[[0-9;]{1,12}[A-Za-z]", " ", clean)
+    clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", clean)
+    leading = len(clean) - len(clean.lstrip(" "))
+    core = re.sub(r"\s+", " ", clean.strip())
+    if not core:
+        return ""
+    return (" " * min(leading, 8)) + core
+
+
+def _humanize_path_part(part: str) -> str:
+    clean = sanitize_text(part).strip().strip("_").replace("-", " ").replace("_", " ")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean.title() if clean else "Unknown"
+
+
+def dashboard_project_is_noise(project: str, repo: str = "") -> bool:
+    """Drop path debris that should not dominate the restart map."""
+    name = dashboard_clean_text(project).lower()
+    path = dashboard_clean_text(repo).lower()
+    if not name or name in {"unknown folder", "untitled session"}:
+        return True
+    noisy = (
+        "history.jsonl",
+        "codex history",
+        ".codex",
+        "node_modules",
+        "untitled",
+    )
+    if any(token in name for token in noisy):
+        return True
+    if any(token in path for token in ("history.jsonl", "/.codex/", "/node_modules/")):
+        return True
+    return False
+
+
+def dashboard_short_tool(source_label_text: str) -> str:
+    mapping = {
+        "Claude Code": "Claude",
+        "Codex": "Codex",
+        "VS Code / Copilot": "Copilot",
+        "Cursor": "Cursor",
+        "Pi": "Pi",
+    }
+    return mapping.get(source_label_text, source_label_text)
+
+
+def dashboard_relative_time(ts: int | None) -> str:
+    if not ts:
+        return "unknown"
+    now = now_ts()
+    delta = max(0, int(now) - int(ts))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    days = delta // 86400
+    if days < 14:
+        return f"{days}d ago"
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def load_last_results(db_path: pathlib.Path | None = None) -> dict[str, Any]:
+    """Load the most relevant selector mapping for this terminal/agent context."""
+    candidates = [result_context_path(), expand(DEFAULT_LAST_RESULTS)]
+    if db_path is not None:
+        # Prefer mappings written against the same private database when present.
+        preferred = []
+        for candidate in candidates:
+            preferred.append(candidate)
+        candidates = preferred
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not candidate.exists():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if db_path is not None and sanitize_text(payload.get('db') or '') not in {'', str(db_path)}:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get('results'), list):
+            return payload
+    return {"results": []}
+
+
 def dashboard_pick_about(messages: list[str], card: SessionCard) -> str:
+    # A model-written summary outranks every heuristic; an evidence card
+    # falls through to the title and message heuristics below.
+    if card.summary_source == SUMMARY_SOURCE_LLM and card.what_this_was:
+        line = clean_card_line(card.what_this_was, 160)
+        if line:
+            return line
     bare_title = re.sub(
         r"^\d{2}/\d{2}/\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+[—-]\s+",
         "",
@@ -2736,7 +3231,7 @@ def dashboard_pick_about(messages: list[str], card: SessionCard) -> str:
     )
     for candidate in (dashboard_topic(card), _short_topic(bare_title), bare_title):
         line = clean_card_line(candidate or "", 120)
-        if line and line.lower() not in {"untitled session", "untitled session."}:
+        if line and line.lower().strip("().") != "untitled session":
             return line
     ranked: list[tuple[float, str]] = []
     for message in messages:
@@ -2815,6 +3310,51 @@ def dashboard_pick_resume(
     if cleaned and re.sub(r"\W+", "", cleaned).lower() not in blocked and not cleaned.startswith(("|", "```", "#", ">")):
         return cleaned
     return ""
+
+
+def dashboard_project_summaries(
+    conn: sqlite3.Connection,
+    source_name: str = "all",
+    thread_limit: int = 10,
+    project_scan_limit: int = 250,
+) -> list[dict[str, Any]]:
+    """Build clean project rows from a wider scan than the visible thread feed."""
+    scan_limit = max(int(thread_limit), int(project_scan_limit), 1)
+    scanned = recent_session_results(conn, scan_limit, source_name, archived_only=False)
+    groups: dict[str, dict[str, Any]] = {}
+    for row, _score, _label in scanned:
+        card = session_card_for_result(conn, row, "", persist=False, use_llm=False)
+        rows = session_rows(conn, row)
+        about, _state, _resume, _clue = dashboard_summary(card, rows, row)
+        repo = card.repo or location_label(row)
+        project = dashboard_project_label(repo)
+        if dashboard_project_is_noise(project, repo):
+            continue
+        bucket = groups.setdefault(
+            project,
+            {
+                "project": project,
+                "count": 0,
+                "latest_ts": card.last_active or 0,
+                "latest_about": about,
+                "latest_session_id": card.session_id,
+                "latest_source": card.source,
+                "repo": repo,
+            },
+        )
+        bucket["count"] += 1
+        ts = card.last_active or 0
+        if ts >= int(bucket["latest_ts"] or 0):
+            bucket["latest_ts"] = ts
+            bucket["latest_about"] = about
+            bucket["latest_session_id"] = card.session_id
+            bucket["latest_source"] = card.source
+            bucket["repo"] = repo
+    ordered = sorted(
+        groups.values(),
+        key=lambda item: (-int(item["latest_ts"] or 0), str(item["project"]).lower()),
+    )
+    return ordered
 
 
 def dashboard_summary(
@@ -2930,13 +3470,7 @@ def extract_task_clause(text: str) -> str:
 
 def strip_card_filler(text: str) -> str:
     text = re.sub(r"^\[Image #\d+\]\s*", "", text)
-    text = re.sub(
-        r"^(?:ok|okay|yea|yeah|honestly|dude|bro|first honest to god|what happened|state|resume|about|next)\s*[:\-–—]?\s*",
-        "",
-        text,
-        flags=re.I,
-    )
-    text = re.sub(r"^›\s*", "", text)
+    text = re.sub(r"^(?:ok|okay|yea|yeah|honestly|dude|bro|first honest to god)[,.\s]+", "", text, flags=re.I)
     return text.strip()
 
 
@@ -2947,12 +3481,74 @@ def clean_card_line(text: str, limit: int = 220) -> str:
     text = strip_card_filler(text)
     text = normalize_card_typos(text)
     text = re.sub(r"\s+", " ", text).strip()
-    if text.startswith(("|", "```", "# ")):
-        return ""
-    first = text.split(" ", 1)[0] if text else ""
-    if re.match(r"^(?:[\w.-]+@[\w.-]+)$", first):
-        return ""
     return compact(text, limit)
+
+
+ABBREVIATION_END_RE = re.compile(
+    r"(?:\b(?:[A-Za-z]|e\.g|i\.e|etc|vs|approx|dr|mr|mrs|ms|st|jr|sr|fig|no|al)\.)$",
+    re.I,
+)
+
+
+def first_card_sentence(text: str, minimum: int = 40) -> str:
+    """First real sentence, ignoring boundaries that are only abbreviations."""
+    for boundary in re.finditer(r"(?<=[.!?])\s", text):
+        head = text[: boundary.start()].strip()
+        if len(head) < minimum or ABBREVIATION_END_RE.search(head):
+            continue
+        return head
+    return text
+
+
+ABOUT_INSTRUCTION = (
+    "Summarize what this session was about in exactly 1 sentence. "
+    "Name the concrete task or topic and the meaningful outcome. "
+    "Ignore shell prompts, handoff boilerplate, and meta-discussion about summaries: "
+)
+NEXT_INSTRUCTION = "What is the next action or resume point from this session? Answer in 1 sentence: "
+
+
+def strip_prompt_echo(answer: str, instruction: str) -> str:
+    """Drop leading sentences that only restate the instruction.
+
+    Small models sometimes repeat the request before answering. Without this the
+    first-sentence rule picks the instruction and the real summary is discarded.
+    """
+    clean = re.sub(r"\s+", " ", sanitize_text(answer)).strip()
+    if not clean:
+        return ""
+    instruction_words = set(re.findall(r"[a-z]+", instruction.lower()))
+    sentences = [part for part in re.split(r"(?<=[.!?])\s+", clean) if part.strip()]
+    for index, sentence in enumerate(sentences):
+        words = re.findall(r"[a-z]+", sentence.lower())
+        if not words:
+            continue
+        borrowed = sum(1 for word in words if word in instruction_words) / len(words)
+        # A real summary names things the instruction never mentions, so total
+        # vocabulary borrowing is what identifies an echo.
+        if borrowed < 1.0:
+            remainder = " ".join(sentences[index:]).strip()
+            return remainder or clean
+    return clean
+
+
+def card_about_line(about: str, limit: int = 300) -> str:
+    """Reduce an LLM About answer to one clean sentence with no ellipsis.
+
+    quality_gate() discards any field that arrives ellipsis-truncated, so a long
+    model answer must be cut at a sentence boundary here rather than mid-word.
+    """
+    clean = re.sub(r"\s+", " ", sanitize_text(about)).strip()
+    if not clean:
+        return ""
+    line = clean_card_line(first_card_sentence(clean), limit)
+    if TRUNCATED_RE.search(line):
+        line = TRUNCATED_RE.sub("", line).rstrip().rstrip(",;:-")
+        if line and line[-1] not in ".!?":
+            line += "."
+    if not re.search(r"[A-Za-z0-9]", line):
+        return ""
+    return line
 
 
 def meaningful_lines(text: str) -> list[str]:
@@ -3259,7 +3855,7 @@ def unique_evidence(items: Iterable[EvidenceLine]) -> tuple[EvidenceLine, ...]:
     return tuple(out)
 
 
-def build_session_card(rows: list[sqlite3.Row], best_row: sqlite3.Row, query: str) -> SessionCard:
+def build_session_card(rows: list[sqlite3.Row], best_row: sqlite3.Row, query: str, use_llm: bool = True) -> SessionCard:
     ordered = sorted(rows or [best_row], key=row_sort_key)
     topic_row = choose_topic_row(ordered, best_row, query)
     topic_evidence = evidence_line("what this was", topic_row, query=query)
@@ -3325,6 +3921,29 @@ def build_session_card(rows: list[sqlite3.Row], best_row: sqlite3.Row, query: st
         item for item in (topic_evidence, happened_evidence, next_evidence) if item is not None
     )
     active_ts = last_user_prompt_ts(ordered, best_row)
+    # LLM synthesis for About / Next clue; regex evidence stays as fallback.
+    # Skip LLM when use_llm=False (dashboard bulk display) to keep it fast.
+    what_this_was = topic_evidence.text
+    summary_source = SUMMARY_SOURCE_EVIDENCE
+    next_clue = next_evidence.text if next_evidence else ""
+    session_text = "\n".join(
+        str(row_field(r, "text", "")) for r in ordered if str(row_field(r, "text", "")).strip()
+    )[:4000]
+    # This is the only place an outbound payload is assembled, so redaction
+    # happens here rather than at each prompt. Local storage keeps the original.
+    session_text, _redacted = redact_secrets(session_text)
+    if use_llm and session_text.strip():
+        about = llm_summarize(f"{ABOUT_INSTRUCTION}{session_text}", max_tokens=140)
+        about = strip_prompt_echo(about, ABOUT_INSTRUCTION)
+        about_line = card_about_line(about) if about else ""
+        if about_line:
+            what_this_was = about_line
+            summary_source = SUMMARY_SOURCE_LLM
+        nxt = strip_prompt_echo(
+            llm_summarize(f"{NEXT_INSTRUCTION}{session_text}"), NEXT_INSTRUCTION
+        )
+        if nxt:
+            next_clue = clean_card_line(nxt, 260)
     return SessionCard(
         title=timestamped_session_title(best_session_title(ordered, topic_row), active_ts),
         source=str(row_field(best_row, "source", "")),
@@ -3332,11 +3951,12 @@ def build_session_card(rows: list[sqlite3.Row], best_row: sqlite3.Row, query: st
         repo=best_repo(ordered, best_row),
         last_active=active_ts,
         last_user_message=last_user_message(ordered, best_row),
-        what_this_was=topic_evidence.text,
+        what_this_was=what_this_was,
         what_happened=happened_evidence.text if happened_evidence else "",
-        next_clue=next_evidence.text if next_evidence else "",
+        next_clue=next_clue,
         mentioned_paths=paths_from_evidence_rows(ordered, evidence),
         evidence=evidence,
+        summary_source=summary_source,
     )
 
 
@@ -3414,6 +4034,7 @@ def card_from_cache_row(row: sqlite3.Row) -> SessionCard:
         next_clue=str(row["next_clue"] or ""),
         mentioned_paths=tuple(sanitize_text(path) for path in paths if sanitize_text(path)),
         evidence=evidence_from_json(str(row["evidence_json"] or "[]")),
+        summary_source=str(row["summary_source"] or SUMMARY_SOURCE_EVIDENCE),
     )
 
 
@@ -3423,9 +4044,9 @@ def store_session_card(conn: sqlite3.Connection, card: SessionCard, text_hash: s
         INSERT OR REPLACE INTO session_cards (
             source, session_id, text_hash, title, repo, last_active,
             what_this_was, what_happened, next_clue, mentioned_paths_json,
-            evidence_json, built_at
+            evidence_json, summary_source, built_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             card.source,
@@ -3439,9 +4060,23 @@ def store_session_card(conn: sqlite3.Connection, card: SessionCard, text_hash: s
             card.next_clue,
             json.dumps(list(card.mentioned_paths), ensure_ascii=False),
             evidence_to_json(card.evidence),
+            card.summary_source,
             now_ts(),
         ),
     )
+
+
+def cached_card_is_current(cached: sqlite3.Row | None) -> bool:
+    """A cached card is reusable unless its summary is a repairable fallback.
+
+    An evidence card was built while the model was unreachable. It is stale as
+    soon as a key exists, so one outage cannot freeze a summary forever.
+    """
+    if cached is None:
+        return False
+    if str(cached["summary_source"] or SUMMARY_SOURCE_EVIDENCE) == SUMMARY_SOURCE_LLM:
+        return True
+    return not llm_available()
 
 
 def cached_base_session_card(
@@ -3449,6 +4084,7 @@ def cached_base_session_card(
     rows: list[sqlite3.Row],
     best_row: sqlite3.Row,
     persist: bool = False,
+    use_llm: bool = True,
 ) -> SessionCard:
     text_hash = session_card_hash(rows or [best_row])
     cached = conn.execute(
@@ -3459,13 +4095,13 @@ def cached_base_session_card(
         """,
         (best_row["source"], best_row["session_id"], text_hash),
     ).fetchone()
-    if cached is not None:
+    if cached_card_is_current(cached):
         return dataclasses.replace(
             card_from_cache_row(cached),
             last_user_message=last_user_message(rows, best_row),
         )
 
-    card = build_session_card(rows, best_row, "")
+    card = build_session_card(rows, best_row, "", use_llm=use_llm)
     if persist:
         store_session_card(conn, card, text_hash)
         conn.commit()
@@ -3473,8 +4109,15 @@ def cached_base_session_card(
 
 
 def merge_query_card(base: SessionCard, query_card: SessionCard, query: str) -> SessionCard:
+    """Overlay query-specific evidence on the cached card.
+
+    The model prompts never contain the query, so a query card can only repeat
+    the base card's summary at full price. The summary is therefore taken from
+    the base card whenever the base card has a real one.
+    """
     if not query:
         return base
+    keep_base_summary = base.summary_source == SUMMARY_SOURCE_LLM and bool(base.what_this_was)
     return SessionCard(
         title=query_card.title or base.title,
         source=base.source,
@@ -3482,11 +4125,15 @@ def merge_query_card(base: SessionCard, query_card: SessionCard, query: str) -> 
         repo=query_card.repo or base.repo,
         last_active=query_card.last_active or base.last_active,
         last_user_message=query_card.last_user_message or base.last_user_message,
-        what_this_was=query_card.what_this_was or base.what_this_was,
+        what_this_was=(
+            base.what_this_was if keep_base_summary
+            else (query_card.what_this_was or base.what_this_was)
+        ),
         what_happened=query_card.what_happened,
-        next_clue=query_card.next_clue,
+        next_clue=base.next_clue if keep_base_summary else query_card.next_clue,
         mentioned_paths=query_card.mentioned_paths or base.mentioned_paths,
         evidence=query_card.evidence or base.evidence,
+        summary_source=base.summary_source if keep_base_summary else query_card.summary_source,
     )
 
 
@@ -3495,39 +4142,61 @@ def session_card_for_result(
     row: sqlite3.Row,
     query: str = "",
     persist: bool = False,
+    use_llm: bool = True,
 ) -> SessionCard:
     rows = session_rows(conn, row)
-    base = cached_base_session_card(conn, rows, row, persist=persist)
+    base = cached_base_session_card(conn, rows, row, persist=persist, use_llm=use_llm)
     if not query:
         return base
-    query_card = build_session_card(rows, row, query)
+    # The query card only re-picks evidence lines. Asking the model again would
+    # send an identical prompt and pay twice for the same sentence.
+    query_card = build_session_card(rows, row, query, use_llm=False)
     return merge_query_card(base, query_card, query)
 
 
-def ensure_session_cards(conn: sqlite3.Connection, limit: int | None = None, quiet: bool = True) -> int:
+def ensure_session_cards(
+    conn: sqlite3.Connection,
+    limit: int | None = None,
+    quiet: bool = True,
+    horizon: int | None = None,
+) -> int:
+    """Build missing cards for the newest sessions.
+
+    `limit` caps this run. `horizon` caps how far back routine backfill is
+    willing to summarize at all; older sessions are summarized on demand when a
+    search surfaces them. It is a parameter rather than a module lookup so a
+    test can set it without patching global state.
+    """
     count = 0
-    with conn:
-        for source, session_id in session_groups(conn, limit=None):
-            row = representative_session_row(conn, source, session_id)
-            if row is None:
-                continue
-            rows = rows_for_session(conn, source, session_id)
-            text_hash = session_card_hash(rows)
-            existing = conn.execute(
-                """
-                SELECT 1
-                FROM session_cards
-                WHERE source = ? AND session_id = ? AND text_hash = ?
-                """,
-                (source, session_id, text_hash),
-            ).fetchone()
-            if existing:
-                continue
-            card = build_session_card(rows, row, "")
-            store_session_card(conn, card, text_hash)
-            count += 1
-            if limit is not None and count >= limit:
-                break
+    if horizon is None:
+        horizon = CARD_BACKFILL_SESSIONS
+    for source, session_id in session_groups(conn, limit=horizon):
+        row = representative_session_row(conn, source, session_id)
+        if row is None:
+            continue
+        rows = rows_for_session(conn, source, session_id)
+        text_hash = session_card_hash(rows)
+        existing = conn.execute(
+            """
+            SELECT summary_source
+            FROM session_cards
+            WHERE source = ? AND session_id = ? AND text_hash = ?
+            """,
+            (source, session_id, text_hash),
+        ).fetchone()
+        if cached_card_is_current(existing):
+            continue
+        if not llm_available():
+            warn_llm_unavailable()
+        card = build_session_card(rows, row, "")
+        # One card per transaction, and the lock is taken only for the
+        # write. An interrupt during the next model call keeps this card.
+        with session_lock(shared=False):
+            with conn:
+                store_session_card(conn, card, text_hash)
+        count += 1
+        if limit is not None and count >= limit:
+            break
     if not quiet:
         if count:
             print(f"Built {count} session cards.")
@@ -3549,7 +4218,7 @@ def session_ref(source: str, session_id: str) -> str:
 
 
 def native_resume_available(source: str, session_id: str) -> bool:
-    return source in {"codex", "claude"} and bool(session_id and session_id != "unknown")
+    return source in NATIVE_REOPEN_SOURCES and bool(session_id and session_id != "unknown")
 
 
 def native_resume_status(source: str, session_id: str) -> str:
@@ -3559,7 +4228,7 @@ def native_resume_status(source: str, session_id: str) -> str:
 
 
 def cross_tool_status(source: str) -> str:
-    if source in {"codex", "claude"}:
+    if source in NATIVE_REOPEN_SOURCES:
         return "context packet only outside native owner"
     return "context packet only"
 
@@ -3572,7 +4241,12 @@ def packet_only_note(source: str) -> str:
     return "Exact native reopen is not available from the indexed local data; use a context packet."
 
 
-def native_resume_lines(source: str, session_id: str, repo: str) -> list[str]:
+def native_resume_lines(
+    source: str,
+    session_id: str,
+    repo: str,
+    path: str = "",
+) -> list[str]:
     if not native_resume_available(source, session_id):
         return []
     lines: list[str] = []
@@ -3582,16 +4256,20 @@ def native_resume_lines(source: str, session_id: str, repo: str) -> list[str]:
         lines.append(f"codex resume {shell_quote(session_id)}")
     elif source == "claude":
         lines.append(f"claude --resume {shell_quote(session_id)}")
+    elif source == "pi":
+        # Prefer the exact JSONL path when known; pi also accepts partial UUIDs.
+        session_ref = path.strip() if path.strip() else session_id
+        lines.append(f"pi --session {shell_quote(session_ref)}")
     return lines
 
 
 def handoff_targets_for(source: str) -> list[str]:
-    targets = ["codex", "claude"]
+    targets = ["codex", "claude", "pi"]
     return [target for target in targets if target != source]
 
 
 def target_label(target: str) -> str:
-    return {"codex": "Codex", "claude": "Claude Code"}.get(target, target)
+    return {"codex": "Codex", "claude": "Claude Code", "pi": "Pi"}.get(target, target)
 
 
 def normalize_target(raw: str) -> str:
@@ -3604,9 +4282,10 @@ def normalize_target(raw: str) -> str:
         "codex": "codex",
         "codecs": "codex",
         "codecx": "codex",
+        "pi": "pi",
     }
     if normalized not in aliases:
-        raise ValueError(f"unsupported target: {raw}. Use codex or claude.")
+        raise ValueError(f"unsupported target: {raw}. Use codex, claude, or pi.")
     return aliases[normalized]
 
 
@@ -3855,7 +4534,7 @@ def recent_session_results(
     source_name: str = "all",
     archived_only: bool = False,
 ) -> list[tuple[sqlite3.Row, float, str]]:
-    sources = ("claude", "codex") if source_name == "all" else (source_name,)
+    sources = ("claude", "codex", "pi") if source_name == "all" else (source_name,)
     placeholders = ",".join("?" for _ in sources)
     candidates = conn.execute(
         f"""
@@ -3930,197 +4609,50 @@ def archived_session_results(
     return [(row, recency_boost(row["archive_status_at"]), "archived") for row in rows], int(missing)
 
 
-def dashboard_terminal_width() -> int:
-    try:
-        width = int(shutil.get_terminal_size(fallback=(100, 24)).columns)
-    except (TypeError, ValueError, OSError):
-        width = 100
-    return max(60, min(width, 200))
-
-
-def dashboard_clean_text(value: str) -> str:
-    """Strip control junk that makes terminal paste unreadable.
-
-    Do not use sanitize_text() here: it line-strips and would destroy the
-    intentional left indentation of dashboard rows.
-    """
-    if value is None:
-        clean = ""
-    elif isinstance(value, str):
-        clean = value
-    else:
-        clean = str(value)
-    clean = re.sub(r"\[[0-9;?]*[A-Za-z]", " ", clean)
-    clean = re.sub(r"\[[0-9;]{1,12}[A-Za-z]", " ", clean)
-    clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", clean)
-    leading = len(clean) - len(clean.lstrip(" "))
-    core = re.sub(r"\s+", " ", clean.strip())
-    if not core:
-        return ""
-    return (" " * min(leading, 8)) + core
-
-
-def dashboard_cell(value: str, width: int) -> str:
-    clean = dashboard_clean_text(value)
-    if width <= 1:
-        return clean[:1]
-    if len(clean) <= width:
-        return clean
-    return clean[: max(1, width - 1)].rstrip() + "…"
-
-
-def dashboard_relative_time(ts: int | None) -> str:
-    if not ts:
-        return "unknown"
-    now = now_ts()
-    delta = max(0, int(now) - int(ts))
-    if delta < 60:
-        return "just now"
-    if delta < 3600:
-        return f"{delta // 60}m ago"
-    if delta < 86400:
-        return f"{delta // 3600}h ago"
-    days = delta // 86400
-    if days < 14:
-        return f"{days}d ago"
-    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d")
-
-
-def _humanize_path_part(part: str) -> str:
-    clean = sanitize_text(part).strip().strip("_").replace("-", " ").replace("_", " ")
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean.title() if clean else "Unknown"
-
-
-def dashboard_project_label(repo: str) -> str:
-    """Turn a working directory into a stable, human-sized project name."""
-    raw = sanitize_text(repo)
-    if not raw or raw in {"unknown", "unknown from index"}:
-        return "Unknown folder"
-    path = pathlib.PurePath(raw)
-    parts = [part for part in path.parts if part not in {"/", "\\"}]
-    if not parts:
-        return "Unknown folder"
-
-    # Prefer the local multitool layout: .../<workspace>/os/<domain>/<project>
-    try:
-        os_at = parts.index("os")
-    except ValueError:
-        os_at = -1
-    if os_at >= 0:
-        relative = parts[os_at + 1 :]
-        if not relative:
-            return "OS root"
-        if len(relative) >= 2:
-            return f"{_humanize_path_part(relative[0])} / {_humanize_path_part(relative[1])}"
-        return _humanize_path_part(relative[0])
-
-    useful = [part for part in parts if part not in {".", ""}]
-    # Hide machine-history paths and bare home noise from the main map labels.
-    joined = "/".join(useful).lower()
-    if joined.endswith("history.jsonl") or "/.codex/" in f"/{joined}/":
-        return "Codex history"
-    if len(useful) >= 2:
-        return " / ".join(_humanize_path_part(part) for part in useful[-2:])
-    return _humanize_path_part(useful[-1])
-
-
-def dashboard_project_is_noise(project: str, repo: str = "") -> bool:
-    """Drop path debris that should not dominate the restart map."""
-    name = dashboard_clean_text(project).lower()
-    path = dashboard_clean_text(repo).lower()
-    if not name or name in {"unknown folder", "untitled session"}:
-        return True
-    noisy = (
-        "history.jsonl",
-        "codex history",
-        ".codex",
-        "node_modules",
-        "untitled",
-    )
-    if any(token in name for token in noisy):
-        return True
-    if any(token in path for token in ("history.jsonl", "/.codex/", "/node_modules/")):
-        return True
-    return False
-
-
-def dashboard_short_tool(source_label_text: str) -> str:
-    mapping = {
-        "Claude Code": "Claude",
-        "Codex": "Codex",
-        "VS Code / Copilot": "Copilot",
-        "Cursor": "Cursor",
-        "Pi": "Pi",
-    }
-    return mapping.get(source_label_text, source_label_text)
-
-
-def print_dashboard_table(headers: list[str], rows: list[list[str]], width: int | None = None) -> None:
-    """Render a plain terminal table when a compact matrix is actually useful."""
-    if not headers:
-        return
-    term_width = dashboard_terminal_width() if width is None else max(40, width)
-    col_count = len(headers)
-    separator_tax = 3 * max(0, col_count - 1)
-    available = max(col_count * 4, term_width - separator_tax)
-    widths = [max(len(header), 4) for header in headers]
-    while sum(widths) > available and any(value > 4 for value in widths[1:]):
-        for index in range(col_count - 1, 0, -1):
-            if widths[index] > 4 and sum(widths) > available:
-                widths[index] -= 1
-    remainder = max(0, available - sum(widths))
-    widths[-1] += remainder
-    print(" | ".join(headers[i].ljust(widths[i]) for i in range(col_count)))
-    print("-+-".join("-" * widths[i] for i in range(col_count)))
-    for row in rows:
-        fitted = [dashboard_cell(str(cell), widths[i]) for i, cell in enumerate(row)]
-        print(" | ".join(fitted[i].ljust(widths[i]) for i in range(col_count)))
-
-
-def dashboard_project_summaries(
+def catch_up_dashboard_cards(
     conn: sqlite3.Connection,
-    source_name: str = "all",
-    thread_limit: int = 10,
-    project_scan_limit: int = 250,
-) -> list[dict[str, Any]]:
-    """Build clean project rows from a wider scan than the visible thread feed."""
-    scan_limit = max(int(thread_limit), int(project_scan_limit), 1)
-    scanned = recent_session_results(conn, scan_limit, source_name, archived_only=False)
-    groups: dict[str, dict[str, Any]] = {}
-    for row, _score, _label in scanned:
-        card = session_card_for_result(conn, row, "", "recent")
-        rows = session_rows(conn, row)
-        about, _state, _resume, _clue = dashboard_summary(card, rows, row)
-        repo = card.repo or location_label(row)
-        project = dashboard_project_label(repo)
-        if dashboard_project_is_noise(project, repo):
+    results: list[tuple[sqlite3.Row, float, str]],
+    limit: int = 10,
+    quiet: bool = True,
+) -> int:
+    """Build missing/stale cards for only the newest visible dashboard sessions."""
+    candidates: list[tuple[list[sqlite3.Row], sqlite3.Row, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row, _score, _label in results:
+        identity = (str(row["source"]), str(row["session_id"]))
+        if identity in seen:
             continue
-        bucket = groups.setdefault(
-            project,
-            {
-                "project": project,
-                "count": 0,
-                "latest_ts": card.last_active or 0,
-                "latest_about": about,
-                "latest_session_id": card.session_id,
-                "latest_source": card.source,
-                "repo": repo,
-            },
-        )
-        bucket["count"] += 1
-        ts = card.last_active or 0
-        if ts >= int(bucket["latest_ts"] or 0):
-            bucket["latest_ts"] = ts
-            bucket["latest_about"] = about
-            bucket["latest_session_id"] = card.session_id
-            bucket["latest_source"] = card.source
-            bucket["repo"] = repo
-    ordered = sorted(
-        groups.values(),
-        key=lambda item: (-int(item["latest_ts"] or 0), str(item["project"]).lower()),
-    )
-    return ordered
+        seen.add(identity)
+        rows = session_rows(conn, row)
+        text_hash = session_card_hash(rows)
+        cached = conn.execute(
+            """
+            SELECT summary_source
+            FROM session_cards
+            WHERE source = ? AND session_id = ? AND text_hash = ?
+            """,
+            (*identity, text_hash),
+        ).fetchone()
+        if cached_card_is_current(cached):
+            continue
+        candidates.append((rows, row, text_hash))
+        if len(candidates) >= limit:
+            break
+
+    if candidates and not llm_available():
+        warn_llm_unavailable()
+    if candidates and not quiet:
+        print(f"Refreshing {len(candidates)} recent session summaries...")
+        sys.stdout.flush()
+
+    stored = 0
+    for rows, row, text_hash in candidates:
+        card = build_session_card(rows, row, "", use_llm=True)
+        with session_lock(shared=False):
+            with conn:
+                store_session_card(conn, card, text_hash)
+        stored += 1
+    return stored
 
 
 def print_dashboard(
@@ -4138,9 +4670,14 @@ def print_dashboard(
         print("Run: ss fresh what did I work on recently")
         return
 
+    if not archived_view:
+        # Build missing or repairable summaries for the visible threads only,
+        # bounded so a dashboard open can never fan out across the index.
+        catch_up_dashboard_cards(conn, results, limit=10, quiet=False)
+
     thread_entries: list[dict[str, Any]] = []
     for rank, (row, _score, label) in enumerate(results, 1):
-        card = session_card_for_result(conn, row, "", label)
+        card = session_card_for_result(conn, row, "", persist=False, use_llm=False)
         rows = session_rows(conn, row)
         about, state, resume, clue = dashboard_summary(card, rows, row)
         repo = card.repo or location_label(row)
@@ -4239,6 +4776,70 @@ def print_dashboard(
         print()
 
     print("ss <search> · ss open N · ss look at N · ss archive N · ss archived")
+
+
+def dashboard_cell(value: str, width: int) -> str:
+    clean = dashboard_clean_text(value)
+    if width <= 1:
+        return clean[:1]
+    if len(clean) <= width:
+        return clean
+    return clean[: max(1, width - 1)].rstrip() + "…"
+
+
+def dashboard_project_label(repo: str) -> str:
+    """Turn a working directory into a stable, human-sized project name."""
+    raw = sanitize_text(repo)
+    if not raw or raw in {"unknown", "unknown from index"}:
+        return "Unknown folder"
+    path = pathlib.PurePath(raw)
+    parts = [part for part in path.parts if part not in {"/", "\\"}]
+    if not parts:
+        return "Unknown folder"
+
+    # Prefer the local multitool layout: .../<workspace>/os/<domain>/<project>
+    try:
+        os_at = parts.index("os")
+    except ValueError:
+        os_at = -1
+    if os_at >= 0:
+        relative = parts[os_at + 1 :]
+        if not relative:
+            return "OS root"
+        if len(relative) >= 2:
+            return f"{_humanize_path_part(relative[0])} / {_humanize_path_part(relative[1])}"
+        return _humanize_path_part(relative[0])
+
+    useful = [part for part in parts if part not in {".", ""}]
+    # Hide machine-history paths and bare home noise from the main map labels.
+    joined = "/".join(useful).lower()
+    if joined.endswith("history.jsonl") or "/.codex/" in f"/{joined}/":
+        return "Codex history"
+    if len(useful) >= 2:
+        return " / ".join(_humanize_path_part(part) for part in useful[-2:])
+    return _humanize_path_part(useful[-1])
+
+
+def print_dashboard_table(headers: list[str], rows: list[list[str]], width: int | None = None) -> None:
+    """Render a plain terminal table when a compact matrix is actually useful."""
+    if not headers:
+        return
+    term_width = dashboard_terminal_width() if width is None else max(40, width)
+    col_count = len(headers)
+    separator_tax = 3 * max(0, col_count - 1)
+    available = max(col_count * 4, term_width - separator_tax)
+    widths = [max(len(header), 4) for header in headers]
+    while sum(widths) > available and any(value > 4 for value in widths[1:]):
+        for index in range(col_count - 1, 0, -1):
+            if widths[index] > 4 and sum(widths) > available:
+                widths[index] -= 1
+    remainder = max(0, available - sum(widths))
+    widths[-1] += remainder
+    print(" | ".join(headers[i].ljust(widths[i]) for i in range(col_count)))
+    print("-+-".join("-" * widths[i] for i in range(col_count)))
+    for row in rows:
+        fitted = [dashboard_cell(str(cell), widths[i]) for i, cell in enumerate(row)]
+        print(" | ".join(fitted[i].ljust(widths[i]) for i in range(col_count)))
 
 
 def dashboard_is_interactive() -> bool:
@@ -4441,34 +5042,6 @@ def print_session_card_detail(card: SessionCard, archived: bool = False) -> None
     print()
 
 
-def load_last_results(db_path: pathlib.Path | None = None) -> dict[str, Any]:
-    """Load the most relevant selector mapping for this terminal/agent context."""
-    candidates = [result_context_path(), expand(DEFAULT_LAST_RESULTS)]
-    if db_path is not None:
-        # Prefer mappings written against the same private database when present.
-        preferred = []
-        for candidate in candidates:
-            preferred.append(candidate)
-        candidates = preferred
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        if not candidate.exists():
-            continue
-        try:
-            payload = json.loads(candidate.read_text(encoding='utf-8'))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if db_path is not None and sanitize_text(payload.get('db') or '') not in {'', str(db_path)}:
-            continue
-        if isinstance(payload, dict) and isinstance(payload.get('results'), list):
-            return payload
-    return {"results": []}
-
-
 def save_last_results(results: list[tuple[sqlite3.Row, float, str]], query: str, db_path: pathlib.Path) -> None:
     context_kind, _context_value = result_context_identity()
     payload = {
@@ -4657,7 +5230,7 @@ def print_resume_instructions(conn: sqlite3.Connection, row: sqlite3.Row, select
     if query:
         print(f"Search query: {query}")
     print()
-    lines = native_resume_lines(source, session_id, repo)
+    lines = native_resume_lines(source, session_id, repo, path=str(row["path"] or ""))
     if lines:
         print("Open exact session:")
         for line in lines:
@@ -4804,6 +5377,11 @@ def launch_lines_for_handoff(target: str, repo: str, packet_path: pathlib.Path) 
         if repo:
             lines.append(f"cd {shell_quote(repo)}")
         lines.append(f"claude --add-dir {shell_quote(packet_dir)} {shell_quote(prompt)}")
+    elif target == "pi":
+        if repo:
+            lines.append(f"cd {shell_quote(repo)}")
+        # Pi has no --add-dir equivalent; put the packet path in the startup prompt.
+        lines.append(f"pi {shell_quote(prompt)}")
     return lines
 
 
@@ -4812,9 +5390,10 @@ def cmd_index(args: argparse.Namespace) -> int:
         db_path = expand(args.db)
         home = expand(args.home)
         conn = connect_db(db_path)
-        init_db(conn)
         if args.reset:
             reset_db(conn)
+        else:
+            init_db(conn)
         sources = normalize_sources(args.source)
         count = upsert_documents(conn, build_docs(home, sources))
         sync_detected_archive_states(conn)
@@ -4984,7 +5563,12 @@ def cmd_handoff(args: argparse.Namespace) -> int:
         repo = best_repo(packet_rows, row)
         if target == row["source"] and native_resume_available(row["source"], row["session_id"]):
             print("That is the native owner. Open the exact session instead:")
-            for line in native_resume_lines(row["source"], row["session_id"], repo):
+            for line in native_resume_lines(
+                row["source"],
+                row["session_id"],
+                repo,
+                path=str(row["path"] or ""),
+            ):
                 print(f"  {line}")
             return 0
 
@@ -5092,14 +5676,16 @@ def cmd_demo(_args: argparse.Namespace) -> int:
 
 
 def cmd_cards(args: argparse.Namespace) -> int:
+    db_path = expand(args.db)
+    if not db_path.exists():
+        print(f"Index not found: {db_path}", file=sys.stderr)
+        return 2
     with session_lock(shared=False):
-        db_path = expand(args.db)
-        if not db_path.exists():
-            print(f"Index not found: {db_path}", file=sys.stderr)
-            return 2
         conn = connect_db(db_path)
         init_db(conn)
-        ensure_session_cards(conn, limit=args.limit, quiet=False)
+    # Building is network bound and can run for minutes. Holding the exclusive
+    # lock across it made every other ss command fail with a lock timeout.
+    ensure_session_cards(conn, limit=args.limit, quiet=False)
     return 0
 
 
@@ -5312,7 +5898,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     index = sub.add_parser("index", help="Build or refresh the search index.")
-    index.add_argument("--source", default="all", help="all or comma list: codex,claude,vscode,cursor")
+    index.add_argument("--source", default="all", help="all or comma list: codex,claude,pi,vscode,cursor")
     index.add_argument("--reset", action="store_true", help="Drop and rebuild the index first.")
     index.add_argument("--quiet", action="store_true")
     index.set_defaults(func=cmd_index)
@@ -5320,7 +5906,7 @@ def build_parser() -> argparse.ArgumentParser:
     search = sub.add_parser("search", help="Search indexed sessions.")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=10)
-    search.add_argument("--source", default="all", choices=["all", "codex", "claude", "vscode", "cursor"])
+    search.add_argument("--source", default="all", choices=list(SOURCE_CHOICES))
     search.add_argument("--mode", default="hybrid", choices=["fts", "local", "hybrid"])
     search.set_defaults(func=cmd_search)
 
@@ -5334,7 +5920,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     archived = sub.add_parser("archived", help="Show sessions marked archived.")
     archived.add_argument("--limit", type=int, default=10)
-    archived.add_argument("--source", default="all", choices=["all", "codex", "claude", "vscode", "cursor"])
+    archived.add_argument("--source", default="all", choices=list(SOURCE_CHOICES))
     archived.add_argument("--no-refresh", action="store_true")
     archived.set_defaults(func=cmd_archived, archived=True, mode="hybrid")
 
@@ -5409,11 +5995,12 @@ def build_natural_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--source",
         default="all",
-        choices=["all", "codex", "claude", "vscode", "cursor"],
+        choices=list(SOURCE_CHOICES),
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--claude", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--codex", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pi", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--copilot", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vscode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("query", nargs="*")
@@ -5423,7 +6010,7 @@ def build_natural_parser() -> argparse.ArgumentParser:
 def parse_natural(argv: list[str]) -> argparse.Namespace:
     parser = build_natural_parser()
     args = parser.parse_args(argv)
-    selected = [name for name in ("claude", "codex", "copilot", "vscode") if getattr(args, name)]
+    selected = [name for name in ("claude", "codex", "pi", "copilot", "vscode") if getattr(args, name)]
     if selected:
         choice = selected[-1]
         args.source = "vscode" if choice in {"copilot", "vscode"} else choice

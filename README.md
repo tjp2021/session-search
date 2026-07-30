@@ -1,13 +1,15 @@
 # SS
 
 SS finds, understands, reopens, and organizes your local Claude Code, Codex,
-VS Code/Copilot, and Cursor sessions.
+Pi, VS Code/Copilot, and Cursor sessions.
 
 Use it when a terminal restarted, a session disappeared, or you remember the
 work but not which AI tool or folder contained it.
 
-SS is local and private. It doesn't send session text to OpenAI, Anthropic,
-GitHub, or another external service.
+Everything runs on your machine by default: indexing, search, ranking, and
+the session cards. One optional feature changes that. When you explicitly turn
+on model summaries, building a card sends session text to OpenRouter. It's off
+until you opt in. See [What leaves your machine](#what-leaves-your-machine).
 
 ## Install
 
@@ -42,21 +44,15 @@ Run this from any folder:
 ss
 ```
 
-After a restart, that is the whole recovery loop. SS prints a short grouped
-list, not a giant spreadsheet:
-
-- Project headers first (`Organic Growth`, `Personal / Career`, ...)
-- Threads under each project, with open numbers
-- One short `About` / `State` / `Resume` block per thread
-- A small footer of older projects still saved, if any
-
-Every thread still keeps the recovery fields:
+SS shows the most recent active sessions across all indexed folders. Each
+result explains:
 
 - `About`: what the session concerned.
 - `State`: what happened or where the work stands.
 - `Resume`: the best visible continuation point.
-- `Clue`: only when a real path or distinctive fact helps
-- `Open`: reopen the exact native session when supported
+- `Clue`: a useful path or distinctive search terms.
+- `Open`: reopen the exact native session when supported.
+- `Details`: inspect more indexed context without changing anything.
 
 If the right session is number 4:
 
@@ -65,18 +61,7 @@ ss open 4
 ```
 
 That's the normal workflow: run `ss`, identify the session, then open its
-number. Closed terminals do not erase sessions. Open numbers belong only to
-the screen you just saw, so run `ss` again in a new terminal before opening.
-
-Control how many threads appear:
-
-```bash
-ss --limit 5
-```
-
-`--limit` is exact. If you ask for 5 sessions, SS shows 5 open numbers. Older
-projects can still show in a short footer so they do not vanish only because
-they sit outside the newest few threads.
+number.
 
 Inside the interactive dashboard, you can also:
 
@@ -88,8 +73,7 @@ Inside the interactive dashboard, you can also:
 
 | What you want | Command |
 | --- | --- |
-| See the project work map | `ss` |
-| Show exactly N newest threads | `ss --limit N` |
+| See recent active sessions | `ss` |
 | Search from memory | `ss <what you remember>` |
 | Force a fresh scan, then search | `ss fresh <what you remember>` |
 | Reopen the selected native session | `ss open N` |
@@ -131,6 +115,7 @@ Use a source name when you remember the tool:
 ```bash
 ss claude <search words>
 ss codex <search words>
+ss pi <search words>
 ss copilot <search words>
 ss cursor <search words>
 ```
@@ -270,6 +255,7 @@ SS reads local session records from:
 
 - Codex thread metadata and prompt history.
 - Claude Code project-session JSONL.
+- Pi agent session JSONL.
 - VS Code/Copilot empty-window chat JSONL and selected state entries.
 - Selected Cursor chat state entries.
 
@@ -299,6 +285,46 @@ vectors:
 ```bash
 ss embed
 ```
+
+## What leaves your machine
+
+Nothing, by default. Session cards are built from local evidence and no
+network call is ever made.
+
+Model summaries are the opt-in exception. They make "About" lines noticeably
+better, and they work by sending session text to OpenRouter. Both switches
+must be set; a stray API key in your environment is not treated as consent:
+
+```bash
+export SS_SUMMARIES=openrouter
+export OPENROUTER_API_KEY=...
+```
+
+With summaries on:
+
+- **What is sent:** up to 4000 characters of a session's text, twice per card,
+  once for "About" and once for the next action.
+- **Credential shapes are stripped first:** API keys, bearer and CLI tokens,
+  hex secrets, plaintext passwords, private keys, and passwords inside
+  database URLs are replaced before the request is built. See
+  `secret_patterns.py`.
+- **What redaction can't do:** names, clients, file paths, and anything else
+  without a machine-recognizable shape still leave the machine. Redaction
+  narrows the credential risk; it isn't a privacy guarantee.
+- **What is never sent:** tool calls and tool results, so command output and
+  file contents that SS never indexed are also never transmitted.
+- **Where it goes:** `openai/gpt-4.1-nano` through
+  `https://openrouter.ai/api/v1/chat/completions`. Your OpenRouter account
+  settings govern whether it's retained or trained on. SS has no say in that.
+- **When it happens:** on `ss cards`, and for at most 10 visible sessions when
+  you open the dashboard. Reading a cached card sends nothing.
+- **How much:** routine backfill covers only the 60 newest sessions. An older
+  session is summarized the first time a search surfaces it, and that summary
+  is cached, so its text is sent once rather than never being read.
+
+Turn summaries off again by unsetting either variable. Cards fall back to
+local evidence lines, and a card built while summaries were off is rebuilt
+automatically the next time they're on.
 
 ## Privacy and safety boundaries
 
@@ -356,7 +382,8 @@ ss status
   output reconstruction remains incomplete.
 - VS Code/Copilot and Cursor exact native reopening isn't proven.
 - Related-session suggestions don't yet form complete cross-tool work threads.
-- Session-card summaries use local evidence and can still be vague.
+- Without model summaries turned on, cards use local evidence and can still
+  be vague.
 - One preserved legacy archive record lacks its original evidence identifier
   and requires manual review.
 
@@ -369,7 +396,7 @@ queries. On the recorded macOS benchmark:
 | --- | ---: | ---: | ---: |
 | FTS | 60.00% | 61.25% | 0.606 |
 | Local fuzzy | 68.75% | 70.00% | 0.694 |
-| Hybrid | 90.00% | 95.00% | 0.919 |
+| Hybrid | 90.00% | 95.00% | 0.918 |
 
 At 1,000 synthetic sessions, hybrid query latency measured 191 ms p50 and 220
 ms p95 after the local embeddings were built. Cold indexing took 105 ms,

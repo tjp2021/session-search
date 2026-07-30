@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 class MigrationFailure(RuntimeError):
@@ -61,6 +61,10 @@ def validate_schema(conn: sqlite3.Connection) -> None:
         "session_archive_events": {"event_id", "source", "session_id", "archived"},
         "session_archive_meta": {"key", "value"},
         "schema_migrations": {"version", "checksum", "applied_at"},
+        "session_cards": {
+            "source", "session_id", "text_hash", "what_this_was",
+            "next_clue", "summary_source", "built_at",
+        },
     }
     for table, columns in required.items():
         actual = table_columns(conn, table)

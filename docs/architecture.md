@@ -38,10 +38,17 @@ query coverage, source constraints, recency, and adversarial suppression.
 
 ### Cards
 
-Cards are extractive and deterministic. Each field comes from indexed evidence.
-The quality gate removes malformed quotation marks, prompt labels, control
-characters, truncation fragments, and repeated fields. Weak evidence produces
-an explicit fallback.
+Cards have two sources. The default is extractive and deterministic: each
+field comes from indexed evidence, and weak evidence produces an explicit
+fallback. With model summaries turned on, an About line can instead be written
+by a model from redacted session text, and the card records which kind it
+holds. The dashboard prefers a model summary only when the card's provenance
+says so, and treats an evidence card as repairable rather than final. The
+quality gate applies to both kinds: malformed quotation marks, prompt labels,
+control characters, truncation fragments, and repeated fields never render.
+
+Session text crosses the network boundary in exactly one function, behind an
+explicit opt-in, with credential shapes stripped before the request exists.
 
 ### State
 

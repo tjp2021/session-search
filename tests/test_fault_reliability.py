@@ -163,6 +163,152 @@ class MigrationFaultTest(unittest.TestCase):
             schema_migrations.execute_statements(conn, "CREATE TABLE unfinished(")
         conn.close()
 
+    def test_completed_cards_survive_an_interrupt_mid_build(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ss.init_db(conn)
+        ss.upsert_documents(
+            conn,
+            [
+                ss.Document(
+                    doc_id=f"d{i}", source="codex", session_id=f"s{i}", title=f"S{i}",
+                    path="/tmp/p", cwd="/tmp/w", role="user", ts=i,
+                    text=f"Work item {i} needs a summary.", meta={},
+                )
+                for i in range(5)
+            ],
+        )
+        calls = {"n": 0}
+
+        def flaky(prompt: str, max_tokens: int = 220) -> str:
+            calls["n"] += 1
+            if calls["n"] > 4:
+                raise KeyboardInterrupt("user pressed ctrl-c")
+            return "Summarized the work item."
+
+        with mock.patch.object(ss, "llm_summarize", side_effect=flaky):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                with self.assertRaises(KeyboardInterrupt):
+                    ss.ensure_session_cards(conn)
+        stored = conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0]
+        self.assertGreaterEqual(stored, 2, "cards completed before the interrupt must be durable")
+        conn.close()
+
+    def test_card_writes_work_inside_a_command_that_already_holds_the_lock(self):
+        # cmd_dashboard holds the exclusive lock for its whole run and then asks
+        # catch-up to build cards, which takes the lock per write. Without a
+        # reentrant lock that inner acquire waits on this same process and the
+        # dashboard dies with a lock timeout.
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ss.init_db(conn)
+        ss.upsert_documents(
+            conn,
+            [
+                ss.Document(
+                    doc_id="d1", source="codex", session_id="s1", title="S1",
+                    path="/tmp/p", cwd="/tmp/w", role="user", ts=1,
+                    text="Work item needs a summary.", meta={},
+                )
+            ],
+        )
+        results = ss.recent_session_results(conn, 1)
+        with mock.patch.object(ss, "llm_summarize", return_value="Summarized the work item."):
+            with mock.patch.object(ss, "llm_available", return_value=True):
+                with ss.session_lock(shared=False):
+                    built = ss.catch_up_dashboard_cards(conn, results)
+        self.assertEqual(built, 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 1)
+        conn.close()
+
+    def test_card_building_does_not_hold_the_write_lock_across_a_model_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "cards.sqlite"
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            ss.init_db(conn)
+            ss.upsert_documents(
+                conn,
+                [
+                    ss.Document(
+                        doc_id=f"d{i}", source="codex", session_id=f"s{i}", title=f"S{i}",
+                        path="/tmp/p", cwd="/tmp/w", role="user", ts=i,
+                        text=f"Work item {i} needs a summary.", meta={},
+                    )
+                    for i in range(4)
+                ],
+            )
+            conn.commit()
+            blocked: list[str] = []
+
+            def probe(prompt: str, max_tokens: int = 220) -> str:
+                # Stands in for time spent waiting on the provider.
+                other = sqlite3.connect(path, timeout=0.2)
+                try:
+                    other.execute("BEGIN IMMEDIATE")
+                    other.rollback()
+                except sqlite3.OperationalError as error:
+                    blocked.append(str(error))
+                finally:
+                    other.close()
+                return "Summarized the work item."
+
+            with mock.patch.object(ss, "llm_summarize", side_effect=probe):
+                with mock.patch.object(ss, "llm_available", return_value=True):
+                    ss.ensure_session_cards(conn)
+            self.assertEqual(
+                blocked, [], "the write transaction was held open across a model call"
+            )
+            conn.close()
+
+    def test_v4_card_cache_is_rebuilt_with_a_provenance_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "legacy.sqlite"
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            ss.init_db(conn)
+            conn.execute("DROP TABLE session_cards")
+            conn.execute(
+                """
+                CREATE TABLE session_cards (
+                    source TEXT NOT NULL, session_id TEXT NOT NULL,
+                    text_hash TEXT NOT NULL, title TEXT NOT NULL, repo TEXT NOT NULL,
+                    last_active INTEGER, what_this_was TEXT NOT NULL,
+                    what_happened TEXT NOT NULL, next_clue TEXT NOT NULL,
+                    mentioned_paths_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                    built_at INTEGER NOT NULL, PRIMARY KEY (source, session_id)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO session_cards VALUES('codex','s1','h','t','r',1,'stale','','','[]','[]',1)"
+            )
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+            conn.close()
+
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            ss.init_db(conn)
+            self.assertEqual(
+                schema_migrations.schema_version(conn), schema_migrations.CURRENT_SCHEMA_VERSION
+            )
+            columns = schema_migrations.table_columns(conn, "session_cards")
+            self.assertIn("summary_source", columns)
+            # The cache is disposable; a legacy row must not survive claiming a
+            # provenance it never had.
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 0)
+            conn.close()
+
+    def test_a_card_cache_missing_provenance_fails_validation(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ss.init_db(conn)
+        conn.execute("ALTER TABLE session_cards DROP COLUMN summary_source")
+        with self.assertRaises(schema_migrations.MigrationFailure):
+            schema_migrations.validate_current_schema(conn)
+        conn.close()
+
     def test_current_schema_is_fully_validated(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -331,3 +477,7 @@ class CliFailureTest(unittest.TestCase):
                 ss.atomic_write_json(path, {"schema_version": 2, "results": []})
             self.assertEqual(json.loads(path.read_text())["schema_version"], 2)
             self.assertIn("committed", stderr.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -27,8 +27,23 @@ without deleting native history.
 
 ## Engineering decisions
 
-SS keeps all retrieval local. Deterministic cards were chosen over generated
-summaries because they remain fast, traceable, private, and reproducible.
+SS keeps all retrieval local. The first release also chose deterministic cards
+over generated summaries because they were fast, traceable, private, and
+reproducible. That held until real dashboards showed the cost: extractive
+About lines were technically correct and still vague.
+
+The second release added model summaries without giving up the original
+guarantees, and each one became a mechanism rather than a promise. Summaries
+are off until the user sets an explicit switch, because an API key in the
+environment is not consent. Credential shapes are stripped at the one place
+the outbound payload is assembled, so no future call site can forget. Every
+card records whether its summary came from the model or from local evidence,
+the dashboard only trusts the model kind, and a card built during an outage is
+rebuilt automatically instead of being cached as if it were good. Routine
+backfill stops at the newest sixty sessions, so the tool never pays to
+summarize work nobody reads. The deterministic cards remain as the universal
+fallback and the local-only mode.
+
 Unsupported editor behavior appears in an executable capability matrix instead
 of being implied by documentation.
 
@@ -46,7 +61,7 @@ across exact, fuzzy, semantic, and time-oriented recovery.
 | --- | ---: | ---: | ---: |
 | Full text | 60.00% | 61.25% | 0.606 |
 | Local fuzzy | 68.75% | 70.00% | 0.694 |
-| Hybrid | 90.00% | 95.00% | 0.919 |
+| Hybrid | 90.00% | 95.00% | 0.918 |
 
 Hybrid search preserved perfect exact-identifier retrieval, raised fuzzy
 top-one accuracy from 15% to 95%, and raised semantic top-one accuracy from
@@ -63,13 +78,21 @@ nested rollbacks erased outer work, partial migrations were trusted, pasted
 commands could archive sessions, typo prefilters disagreed with the parser,
 and weak evidence produced malformed cards.
 
+The summary work went through the same treatment. A review of the first
+implementation proved that a failed model call was cached forever as a good
+card, that raw transcript lines could reach the dashboard when the cache
+missed, and that two different truncation rules disagreed about typographic
+ellipses. Mutation testing then killed sixteen surviving mutants in the suite
+itself, including a privacy check that silently skipped files nobody listed.
+
 Those failures were retained as regressions. Independent archive-intent batches
 were recorded even when they failed rather than being relabeled after the
 fact.
 
 ## Current boundary
 
-This release supports macOS. Claude Code and Codex have proven native reopening.
+This release supports macOS. Claude Code, Codex, and Pi have proven native
+reopening.
 VS Code/Copilot and Cursor remain searchable and support packet continuation,
 but exact native reopening isn't claimed. Codex assistant output is partially
 available because its low-level telemetry doesn't yet provide a stable,

@@ -72,3 +72,7 @@ class ArchiveConcurrencyTest(unittest.TestCase):
             self.assertEqual(status["status_at"], 200)
             self.assertEqual(status["archived"], 0)
             conn.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

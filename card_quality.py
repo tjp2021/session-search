@@ -12,7 +12,9 @@ NO_CLEAR_STATE = "No clear completed work found in local evidence."
 NO_CLEAR_RESUME = "No clear next step found in local evidence."
 
 _PREFIX_RE = re.compile(r"^\s*(?:about|state|resume|next|context)\s*:\s*", re.I)
-_TRUNCATED_RE = re.compile(r"(?:\.\.\.|…)\s*$")
+# The single definition of "this text was cut off". session_search imports this
+# so a repair there and a rejection here can never disagree.
+TRUNCATED_RE = re.compile(r"(?:\.\.\.|…)\s*$")
 _KNOWN_NOISE_RE = re.compile(r"\baftrer\b", re.I)
 _SPACE_RE = re.compile(r"\s+")
 
@@ -41,7 +43,7 @@ def clean_card_field(value: str, limit: int = 260) -> str:
             text = text[len(opener) : -len(closer)].strip()
             break
     text = text.lstrip("\"'`“”‘’ ").strip()
-    if not text or _KNOWN_NOISE_RE.search(text) or _TRUNCATED_RE.search(text):
+    if not text or _KNOWN_NOISE_RE.search(text) or TRUNCATED_RE.search(text):
         return ""
     text = _balanced_prefix(text, "(", ")")
     text = _balanced_prefix(text, "[", "]")

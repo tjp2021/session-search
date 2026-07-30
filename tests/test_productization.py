@@ -74,26 +74,43 @@ class PortableConfigurationTest(unittest.TestCase):
 
 class AdapterCapabilityTest(unittest.TestCase):
     def test_capability_matrix_is_executable_truth(self):
+        # Derived from the functions that implement reopen, not restated from
+        # the data literal. Restating it let a Pi entry claim a capability the
+        # code no longer had, with the suite still green.
         matrix = adapter_capabilities.capability_matrix()
-        self.assertEqual(set(matrix), {"claude", "codex", "vscode", "cursor"})
-        self.assertTrue(matrix["claude"].native_reopen)
-        self.assertTrue(matrix["codex"].native_reopen)
-        self.assertFalse(matrix["vscode"].native_reopen)
-        self.assertFalse(matrix["cursor"].native_reopen)
+        self.assertEqual(set(matrix), set(ss.SUPPORTED_SOURCES))
+        for source, capability in matrix.items():
+            self.assertEqual(
+                capability.native_reopen,
+                ss.native_resume_available(source, "abc123"),
+                f"{source} declares native_reopen={capability.native_reopen} "
+                "but the reopen path disagrees",
+            )
+            self.assertEqual(
+                capability.native_reopen,
+                ss.cross_tool_status(source) == "context packet only outside native owner",
+                f"{source} cross-tool status contradicts its declared reopen support",
+            )
         self.assertEqual(matrix["codex"].assistant_messages, "partial")
 
     def test_capabilities_render_without_private_paths(self):
         rendered = adapter_capabilities.render_capabilities()
         self.assertIn("Claude Code", rendered)
         self.assertIn("packet", rendered.lower())
-        self.assertNotIn("/Users/", rendered)
-        self.assertNotIn("private-workspace-marker", rendered)
+        # Real leak shapes, not a sentinel string that appears nowhere else.
+        for private in ("/Users/", "/home/", str(pathlib.Path.home()), "YN" + "G"):
+            self.assertNotIn(private, rendered)
 
     def test_cli_capabilities_command_uses_capability_matrix(self):
         stdout = StringIO()
         with redirect_stdout(stdout):
             self.assertEqual(ss.main(["capabilities"]), 0)
-        self.assertIn("VS Code/Copilot", stdout.getvalue())
+        printed = stdout.getvalue()
+        # Every declared adapter must appear, so the command cannot pass by
+        # printing one hardcoded label.
+        for capability in adapter_capabilities.capability_matrix().values():
+            self.assertIn(capability.label, printed)
+        self.assertIn(adapter_capabilities.render_capabilities().strip(), printed)
 
     def test_demo_is_isolated_from_native_archive_discovery(self):
         stdout = StringIO()

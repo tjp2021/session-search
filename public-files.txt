@@ -1,5 +1,5 @@
-.coveragerc
 .cos/contracts.json
+.coveragerc
 .github/workflows/ci.yml
 .gitignore
 LICENSE
@@ -29,6 +29,7 @@ retrieval_eval.py
 schema_migrations.py
 scripts/check_public_privacy.py
 scripts/export_public.py
+secret_patterns.py
 session_search.py
 ss_config.py
 tests/benchmark_archive.py
@@ -37,12 +38,15 @@ tests/run_public_card_quality_eval.py
 tests/run_public_retrieval_eval.py
 tests/test_archive_concurrency.py
 tests/test_archive_intent.py
-tests/test_fault_reliability.py
-tests/test_natural_parser.py
-tests/test_productization.py
 tests/test_behavior_contracts.py
 tests/test_dashboard_summary_quality.py
 tests/test_dashboard_work_map.py
+tests/test_fault_reliability.py
+tests/test_natural_parser.py
+tests/test_productization.py
 tests/test_public_card_quality.py
 tests/test_retrieval_metrics.py
+tests/test_secret_redaction.py
+tests/test_suite_integrity.py
+tests/test_summaries_opt_in.py
 uv.lock
