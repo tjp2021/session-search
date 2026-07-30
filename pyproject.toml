@@ -48,7 +48,13 @@ py-modules = [
   "schema_migrations",
   "secret_patterns",
   "session_search",
+  "ss_adapters",
+  "ss_cards",
+  "ss_cli",
   "ss_config",
+  "ss_dashboard",
+  "ss_packets",
+  "ss_retrieval",
 ]
 
 [tool.setuptools.data-files]

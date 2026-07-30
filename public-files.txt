@@ -31,7 +31,13 @@ scripts/check_public_privacy.py
 scripts/export_public.py
 secret_patterns.py
 session_search.py
+ss_adapters.py
+ss_cards.py
+ss_cli.py
 ss_config.py
+ss_dashboard.py
+ss_packets.py
+ss_retrieval.py
 tests/benchmark_archive.py
 tests/benchmark_public.py
 tests/run_public_card_quality_eval.py

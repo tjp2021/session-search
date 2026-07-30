@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import inspect
 import io
 import pathlib
 import tempfile
@@ -38,10 +39,9 @@ class DashboardBehaviorContracts(unittest.TestCase):
             projects.assert_called_once()
 
     def test_dashboard_keeps_about_state_and_resume(self):
-        source = pathlib.Path(ss.__file__).read_text(encoding="utf-8")
-        dashboard_start = source.index("def print_dashboard(")
-        dashboard_end = source.index("\ndef dashboard_is_interactive", dashboard_start)
-        dashboard = source[dashboard_start:dashboard_end]
+        # Resolve the source from the function itself so the contract follows
+        # print_dashboard wherever the facade split places it.
+        dashboard = inspect.getsource(ss.print_dashboard)
         self.assertTrue(
             'About: {about}' in dashboard or 'f"About: {about}"' in dashboard or "About: {about}" in dashboard
         )

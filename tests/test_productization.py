@@ -1,5 +1,6 @@
 import os
 import pathlib
+import re
 import tempfile
 import tomllib
 import unittest
@@ -20,6 +21,23 @@ class PortableConfigurationTest(unittest.TestCase):
             payload = tomllib.load(handle)
         self.assertEqual(payload["project"]["scripts"]["ss"], "session_search:main")
         self.assertEqual(payload["project"]["requires-python"], ">=3.11")
+
+    def test_every_facade_concern_module_ships_with_the_package(self):
+        # Derived from the facade's own imports, not restated as a list. A
+        # module missing from py-modules imports fine from a checkout and
+        # fails only after a pipx install; missing from public-files.txt it
+        # never reaches the public repository at all.
+        root = pathlib.Path(__file__).resolve().parents[1]
+        with (root / "pyproject.toml").open("rb") as handle:
+            payload = tomllib.load(handle)
+        modules = set(payload["tool"]["setuptools"]["py-modules"])
+        manifest = (root / "public-files.txt").read_text(encoding="utf-8").splitlines()
+        facade = (root / "session_search.py").read_text(encoding="utf-8")
+        imported = set(re.findall(r"^from (ss_\w+) import", facade, flags=re.M))
+        self.assertTrue(imported, "the facade imports no concern modules")
+        for name in sorted(imported):
+            self.assertIn(name, modules, f"{name} is missing from py-modules")
+            self.assertIn(f"{name}.py", manifest, f"{name}.py is missing from public-files.txt")
 
     def test_default_paths_use_application_support(self):
         with tempfile.TemporaryDirectory() as tmpdir:
