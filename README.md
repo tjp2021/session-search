@@ -388,8 +388,8 @@ See `docs/case-study.md` for the engineering narrative and
 
 ## Developer reference
 
-The installed `ss` command launches `session_search.py` through
-`ss_launcher.sh`. Normal use should go through `ss`. The lower-level commands
+The installed `ss` command runs the `session_search:main` entry point
+declared in `pyproject.toml`. Normal use should go through `ss`. The lower-level commands
 below support development and diagnostics.
 
 Run the test suite:
