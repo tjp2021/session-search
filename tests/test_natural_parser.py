@@ -1101,20 +1101,24 @@ class VisibleEvalTest(unittest.TestCase):
 
 
 class OutputShapeTest(unittest.TestCase):
-    def test_dashboard_runs_catch_up_before_rendering(self):
+    def test_dashboard_renders_without_waiting_for_summary_backfill(self):
         conn = make_conn_with_docs(
             [doc(doc_id="doc-1", session_id="session-1", text="Fresh dashboard work.", ts=1)]
         )
         results = ss.recent_session_results(conn, 1)
         with mock.patch.object(
             ss,
+            "catch_up_dashboard_cards",
+            side_effect=AssertionError("dashboard waited for summary backfill"),
+        ), mock.patch.object(
+            ss,
             "llm_summarize",
-            side_effect=["Summarized the fresh dashboard work.", "Resume the fresh dashboard work."],
+            side_effect=AssertionError("dashboard made a model call"),
         ):
             with contextlib.redirect_stdout(io.StringIO()):
                 ss.print_dashboard(conn, results)
 
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 0)
         conn.close()
 
     def test_dashboard_catch_up_builds_at_most_ten_missing_cards(self):
@@ -1629,7 +1633,7 @@ class OutputShapeTest(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0], 1)
         conn.close()
 
-    def test_dashboard_asks_for_a_bounded_number_of_rebuilds(self):
+    def test_dashboard_never_starts_summary_rebuilds(self):
         conn = make_conn_with_docs(
             [
                 doc(doc_id=f"d{i}", session_id=f"s{i}", title=f"S{i}", text=f"Work {i}.", ts=i)
@@ -1640,12 +1644,7 @@ class OutputShapeTest(unittest.TestCase):
         with mock.patch.object(ss, "catch_up_dashboard_cards", return_value=0) as catch_up:
             with contextlib.redirect_stdout(io.StringIO()):
                 ss.print_dashboard(conn, results)
-        catch_up.assert_called_once()
-        limit = catch_up.call_args.kwargs.get("limit")
-        self.assertIsNotNone(limit, "the dashboard must pass an explicit rebuild bound")
-        # An unbounded dashboard open is a paid fan-out over every visible row.
-        self.assertGreaterEqual(limit, 1)
-        self.assertLessEqual(limit, 10)
+        catch_up.assert_not_called()
         conn.close()
 
     def test_catch_up_counts_each_session_once(self):

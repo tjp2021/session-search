@@ -770,11 +770,6 @@ def print_dashboard(
         print("Run: ss fresh what did I work on recently")
         return
 
-    if not archived_view:
-        # Build missing or repairable summaries for the visible threads only,
-        # bounded so a dashboard open can never fan out across the index.
-        ss.catch_up_dashboard_cards(conn, results, limit=10, quiet=False)
-
     thread_entries: list[dict[str, Any]] = []
     for rank, (row, _score, label) in enumerate(results, 1):
         card = ss.session_card_for_result(conn, row, "", persist=False, use_llm=False)
