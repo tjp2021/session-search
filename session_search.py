@@ -764,7 +764,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     known = {
         "index", "search", "show", "resume", "handoff", "status", "capabilities", "demo",
-        "cards", "embed", "eval",
+        "cards", "embed", "eval", "project",
         "archived", "archive", "unarchive", "archive-audit",
     }
     if argv == ["refresh"]:
@@ -859,8 +859,9 @@ from ss_dashboard import (  # noqa: E402
     _strip_card_prefixes, alternate_harness_line, archived_session_results, card_visible_text,
     catch_up_dashboard_cards, dashboard_cell, dashboard_clean_text, dashboard_is_interactive,
     dashboard_key_terms, dashboard_pick_about, dashboard_pick_resume, dashboard_pick_state,
-    dashboard_project_is_noise, dashboard_project_label, dashboard_project_summaries,
-    dashboard_prompt, dashboard_relative_time, dashboard_sentences, dashboard_short_tool,
+    dashboard_project_is_noise, dashboard_project_label, dashboard_project_results,
+    dashboard_project_summaries, dashboard_prompt, dashboard_relative_time,
+    dashboard_sentences, dashboard_short_tool,
     dashboard_summary, dashboard_terminal_width, dashboard_topic, evidence_terms,
     evidence_terms_from_text, hit_count, iter_dashboard_updates, location_label,
     owner_action_label, print_dashboard, print_dashboard_table, print_results,
@@ -884,8 +885,8 @@ from ss_packets import (  # noqa: E402
 from ss_cli import (  # noqa: E402
     build_natural_parser, build_parser, cmd_archive_audit, cmd_archived, cmd_capabilities,
     cmd_cards, cmd_continue, cmd_dashboard, cmd_demo, cmd_embed, cmd_eval, cmd_handoff,
-    cmd_index, cmd_natural, cmd_resume, cmd_search, cmd_set_archive, cmd_show, cmd_status,
-    eval_rule_matches, eval_text_for_result, eval_title, first_numeric_selector,
+    cmd_index, cmd_natural, cmd_project, cmd_resume, cmd_search, cmd_set_archive, cmd_show,
+    cmd_status, eval_rule_matches, eval_text_for_result, eval_title, first_numeric_selector,
     load_eval_cases, normalize_eval_terms, parse_natural, parse_natural_followup,
     result_rank_for_rules, run_search,
 )

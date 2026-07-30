@@ -276,17 +276,14 @@ def dashboard_pick_resume(
     return ""
 
 
-def dashboard_project_summaries(
+def _dashboard_project_scan_rows(
     conn: sqlite3.Connection,
     source_name: str = "all",
-    thread_limit: int = 10,
-    project_scan_limit: int = 250,
-) -> list[dict[str, Any]]:
-    """Build project rows without rebuilding every historical session card."""
-    scan_limit = max(int(thread_limit), int(project_scan_limit), 1)
+    scan_limit: int = 250,
+) -> list[sqlite3.Row]:
     sources = ("claude", "codex", "pi") if source_name == "all" else (source_name,)
     placeholders = ",".join("?" for _source in sources)
-    scanned = conn.execute(
+    return conn.execute(
         f"""
         WITH sessions AS (
             SELECT d.source,
@@ -330,12 +327,55 @@ def dashboard_project_summaries(
         WHERE latest_user_rows.row_rank = 1
         ORDER BY latest_user_rows.last_user_ts DESC
         """,
-        [*sources, scan_limit],
+        [*sources, max(1, int(scan_limit))],
     ).fetchall()
+
+
+def _dashboard_row_project(row: sqlite3.Row) -> tuple[str, str]:
+    repo = str(row["cached_repo"] or "") or ss.location_label(row)
+    return ss.dashboard_project_label(repo), repo
+
+
+def dashboard_project_results(
+    conn: sqlite3.Connection,
+    project_name: str,
+    limit: int = 200,
+    source_name: str = "all",
+    scan_limit: int = 5000,
+) -> tuple[str, list[tuple[sqlite3.Row, float, str]]]:
+    """Return active sessions whose stable dashboard label matches one project."""
+    requested = ss.dashboard_clean_text(project_name).casefold()
+    if not requested:
+        return "", []
+    matched_name = ""
+    results: list[tuple[sqlite3.Row, float, str]] = []
+    for row in _dashboard_project_scan_rows(conn, source_name, scan_limit):
+        project, repo = _dashboard_row_project(row)
+        if ss.dashboard_project_is_noise(project, repo) or project.casefold() != requested:
+            continue
+        matched_name = project
+        activity_ts = max(
+            int(row["last_user_ts"] or 0),
+            int(row["cached_last_active"] or 0),
+        )
+        results.append((row, ss.recency_boost(activity_ts), "project"))
+        if len(results) >= max(1, int(limit)):
+            break
+    return matched_name, results
+
+
+def dashboard_project_summaries(
+    conn: sqlite3.Connection,
+    source_name: str = "all",
+    thread_limit: int = 10,
+    project_scan_limit: int = 250,
+) -> list[dict[str, Any]]:
+    """Build project rows without rebuilding every historical session card."""
+    scan_limit = max(int(thread_limit), int(project_scan_limit), 1)
+    scanned = _dashboard_project_scan_rows(conn, source_name, scan_limit)
     groups: dict[str, dict[str, Any]] = {}
     for row in scanned:
-        repo = str(row["cached_repo"] or "") or ss.location_label(row)
-        project = ss.dashboard_project_label(repo)
+        project, repo = _dashboard_row_project(row)
         if ss.dashboard_project_is_noise(project, repo):
             continue
         about = ss.clean_card_line(str(row["cached_about"] or ""), 160)
@@ -760,15 +800,16 @@ def print_dashboard(
     results: list[tuple[sqlite3.Row, float, str]],
     archived_view: bool = False,
     project_summaries: list[dict[str, Any]] | None = None,
-) -> None:
+    heading: str = "",
+) -> list[dict[str, Any]]:
     """Restart recovery screen: sparse, grouped, scannable."""
     width = ss.dashboard_terminal_width()
-    title = "SS archived" if archived_view else "SS"
+    title = heading or ("SS archived" if archived_view else "SS")
     print(title)
     if not results:
         print("No saved Claude/Codex sessions yet.")
         print("Run: ss fresh what did I work on recently")
-        return
+        return []
 
     thread_entries: list[dict[str, Any]] = []
     for rank, (row, _score, label) in enumerate(results, 1):
@@ -870,15 +911,19 @@ def print_dashboard(
 
     if more_projects:
         print("Older projects still saved:")
-        for item in more_projects:
+        for project_rank, item in enumerate(more_projects, 1):
             when = ss.dashboard_relative_time(item.get("latest_ts"))
             summary = (
-                f"- {item['project']} · {when} · {item.get('count', 0)} threads · "
+                f"P{project_rank} · {item['project']} · {when} · "
+                f"{item.get('count', 0)} threads · "
                 f"{item.get('latest_about') or 'No summary available.'}"
             )
             for line in dashboard_wrapped_lines(summary, max(1, width - 2)):
                 print(f"  {line}")
-        for line in dashboard_wrapped_lines("Search one: ss <words> · See finished: ss archived", max(1, width - 2)):
+        for line in dashboard_wrapped_lines(
+            "Choose project: pN · Search: ss <words> · See finished: ss archived",
+            max(1, width - 2),
+        ):
             print(f"  {line}")
         print()
 
@@ -887,6 +932,7 @@ def print_dashboard(
         width,
     ):
         print(line)
+    return more_projects
 
 
 def dashboard_cell(value: str, width: int) -> str:
@@ -1104,12 +1150,31 @@ def dashboard_prompt(args: argparse.Namespace) -> int:
         return 0
     while True:
         try:
-            choice = input("Open a number, type search words, or q: ").strip()
+            choice = input("Open N, choose project Pn, type search words, or q: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
         if not choice or choice.lower() in {"q", "quit", "exit"}:
             return 0
+        project_match = re.fullmatch(r"p(\d+)", choice, flags=re.I)
+        if project_match:
+            project_choices = list(getattr(args, "project_choices", []) or [])
+            project_index = int(project_match.group(1)) - 1
+            if project_index < 0 or project_index >= len(project_choices):
+                print(f"Project selector not found: {choice}")
+                continue
+            print()
+            return ss.cmd_project(
+                argparse.Namespace(
+                    db=args.db,
+                    home=args.home,
+                    project=str(project_choices[project_index]["project"]),
+                    limit=200,
+                    source=args.source,
+                    mode=args.mode,
+                    no_refresh=True,
+                )
+            )
         if choice.isdigit():
             print()
             return ss.cmd_resume(argparse.Namespace(db=args.db, selector=choice))
@@ -1129,6 +1194,21 @@ def dashboard_prompt(args: argparse.Namespace) -> int:
                     mode=args.mode,
                 )
             )
+        if tokens and tokens[0].lower() == "project":
+            project_value = " ".join(tokens[1:]).strip()
+            if project_value:
+                print()
+                return ss.cmd_project(
+                    argparse.Namespace(
+                        db=args.db,
+                        home=args.home,
+                        project=project_value,
+                        limit=200,
+                        source=args.source,
+                        mode=args.mode,
+                        no_refresh=True,
+                    )
+                )
         followup = ss.parse_natural_followup(tokens)
         if followup is not None:
             followup.db = args.db

@@ -45,15 +45,53 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 thread_limit=args.limit,
             )
         ss.save_last_results(results, "recent sessions dashboard", db_path)
-        ss.print_dashboard(
+        project_choices = ss.print_dashboard(
             conn,
             results,
             archived_view=archived_view,
             project_summaries=project_summaries,
         )
+        args.project_choices = project_choices
         if missing_archived:
             print(f"{missing_archived} archived session(s) are missing from the index. Run: ss fresh archived")
         conn.close()
+    return ss.dashboard_prompt(args)
+
+
+def cmd_project(args: argparse.Namespace) -> int:
+    raw_name = getattr(args, "project", "")
+    project_name = " ".join(raw_name) if isinstance(raw_name, list) else str(raw_name)
+    with ss.session_lock(shared=False):
+        db_path = ss.expand(args.db)
+        if not db_path.exists():
+            print(f"Index not found: {db_path}", file=sys.stderr)
+            return 2
+        conn = ss.connect_db(db_path)
+        ss.init_db(conn)
+        canonical_name, results = ss.dashboard_project_results(
+            conn,
+            project_name,
+            limit=max(200, int(getattr(args, "limit", 200))),
+            source_name=getattr(args, "source", "all") or "all",
+        )
+        if not results:
+            print(f"Project not found: {project_name}", file=sys.stderr)
+            conn.close()
+            return 2
+        ss.save_last_results(results, f"project: {canonical_name}", db_path)
+        ss.print_dashboard(
+            conn,
+            results,
+            project_summaries=[],
+            heading=f"SS project · {canonical_name}",
+        )
+        conn.close()
+    args.project_choices = []
+    args.home = getattr(args, "home", "~")
+    args.no_refresh = True
+    args.limit = max(200, int(getattr(args, "limit", 200)))
+    args.source = getattr(args, "source", "all") or "all"
+    args.mode = getattr(args, "mode", "hybrid")
     return ss.dashboard_prompt(args)
 
 
@@ -623,6 +661,18 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
 def cmd_natural(args: argparse.Namespace) -> int:
     query_parts = list(args.query)
+    if query_parts and query_parts[0].lower() == "project":
+        return ss.cmd_project(
+            argparse.Namespace(
+                db=args.db,
+                home=args.home,
+                project=query_parts[1:],
+                limit=200,
+                source=args.source,
+                mode=args.mode,
+                no_refresh=True,
+            )
+        )
     force_refresh = bool(getattr(args, "fresh", False))
     if query_parts and query_parts[0].lower() in {"fresh", "refresh", "new"}:
         force_refresh = True
@@ -686,6 +736,12 @@ def build_parser() -> argparse.ArgumentParser:
     archived.add_argument("--source", default="all", choices=list(ss.SOURCE_CHOICES))
     archived.add_argument("--no-refresh", action="store_true")
     archived.set_defaults(func=ss.cmd_archived, archived=True, mode="hybrid")
+
+    project = sub.add_parser("project", help="Show every indexed session in one dashboard project.")
+    project.add_argument("project", nargs="+")
+    project.add_argument("--limit", type=int, default=200)
+    project.add_argument("--source", default="all", choices=list(ss.SOURCE_CHOICES))
+    project.set_defaults(func=ss.cmd_project, mode="hybrid", home="~", no_refresh=True)
 
     archive_audit = sub.add_parser("archive-audit", help="Preview parser migration repairs without changing state.")
     archive_audit.set_defaults(func=ss.cmd_archive_audit)

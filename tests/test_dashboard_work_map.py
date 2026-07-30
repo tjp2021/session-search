@@ -250,13 +250,116 @@ class DashboardWorkMapContracts(unittest.TestCase):
             mock.patch.object(ss, "dashboard_terminal_width", return_value=40),
             contextlib.redirect_stdout(out),
         ):
-            ss.print_dashboard(self.conn, results, project_summaries=older)
+            choices = ss.print_dashboard(self.conn, results, project_summaries=older)
         rendered = out.getvalue()
         self.assertIn("Older projects still saved:", rendered)
+        self.assertIn("P1 · Robots", rendered)
+        self.assertIn("Choose project: pN", rendered)
+        self.assertEqual([item["project"] for item in choices], ["Robots"])
         self.assertNotIn("…", rendered)
         for word in "Compare remaining battery publishing complete inventory".split():
             self.assertIn(word, rendered)
         self.assertTrue(all(wcswidth(line) <= 40 for line in rendered.splitlines()))
+
+    def test_project_results_include_only_the_selected_project(self) -> None:
+        for index in range(3):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"career-{index}",
+                cwd="/Users/alex/workspace/os/personal/career",
+                title=f"Career {index}",
+                about=f"Career work {index}",
+                state="Prepared evidence",
+                resume="Continue the application",
+                ts=100 + index,
+            )
+        _seed_session(
+            self.conn,
+            source="claude",
+            session_id="osmo-1",
+            cwd="/Users/alex/workspace/os/_shared/osmo",
+            title="Osmo",
+            about="Build learning cards",
+            state="Imported topics",
+            resume="Run the next lesson",
+            ts=200,
+        )
+
+        name, results = ss.dashboard_project_results(self.conn, "personal / career")
+
+        self.assertEqual(name, "Personal / Career")
+        self.assertEqual(len(results), 3)
+        self.assertEqual(
+            {str(row["session_id"]) for row, _score, _label in results},
+            {"career-0", "career-1", "career-2"},
+        )
+
+    def test_project_command_renders_cards_and_saves_the_expanded_ranks(self) -> None:
+        for index in range(2):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"career-{index}",
+                cwd="/Users/alex/workspace/os/personal/career",
+                title=f"Career {index}",
+                about=f"Career work {index}",
+                state="Prepared evidence",
+                resume="Continue the application",
+                ts=100 + index,
+            )
+        out = io.StringIO()
+        args = argparse.Namespace(
+            db=str(self.db),
+            home=str(self.home),
+            project="Personal / Career",
+            limit=200,
+            source="all",
+            mode="hybrid",
+            no_refresh=True,
+        )
+        with (
+            mock.patch.object(ss, "dashboard_is_interactive", return_value=False),
+            mock.patch.object(ss, "save_last_results") as save,
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(ss.cmd_project(args), 0)
+
+        rendered = out.getvalue()
+        self.assertIn("SS project · Personal / Career", rendered)
+        self.assertIn("Open: ss open 1", rendered)
+        self.assertIn("Open: ss open 2", rendered)
+        save.assert_called_once()
+        saved_results, saved_query, saved_db = save.call_args.args
+        self.assertEqual(saved_query, "project: Personal / Career")
+        self.assertEqual(saved_db.resolve(), self.db.resolve())
+        self.assertEqual(
+            {str(row["session_id"]) for row, _score, _label in saved_results},
+            {"career-0", "career-1"},
+        )
+
+    def test_interactive_project_selector_opens_its_bucket(self) -> None:
+        args = argparse.Namespace(
+            db=str(self.db),
+            home=str(self.home),
+            limit=10,
+            source="all",
+            mode="hybrid",
+            no_refresh=True,
+            project_choices=[{"project": "Shared / Osmo"}],
+        )
+        with (
+            mock.patch.object(ss, "dashboard_is_interactive", return_value=True),
+            mock.patch("builtins.input", return_value="p1"),
+            mock.patch.object(ss, "cmd_project", return_value=0) as project,
+        ):
+            self.assertEqual(ss.dashboard_prompt(args), 0)
+        self.assertEqual(project.call_args.args[0].project, "Shared / Osmo")
+
+    def test_direct_project_command_routes_to_project_view(self) -> None:
+        with mock.patch.object(ss, "cmd_project", return_value=0) as project:
+            self.assertEqual(ss.main(["project", "Personal / Career"]), 0)
+        self.assertEqual(project.call_args.args[0].project, ["Personal / Career"])
 
     def test_open_numbers_match_saved_selector_order(self) -> None:
         for index, name in enumerate(("alpha", "beta", "gamma"), start=1):
