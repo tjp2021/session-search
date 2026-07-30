@@ -282,37 +282,92 @@ def dashboard_project_summaries(
     thread_limit: int = 10,
     project_scan_limit: int = 250,
 ) -> list[dict[str, Any]]:
-    """Build clean project rows from a wider scan than the visible thread feed."""
+    """Build project rows without rebuilding every historical session card."""
     scan_limit = max(int(thread_limit), int(project_scan_limit), 1)
-    scanned = ss.recent_session_results(conn, scan_limit, source_name, archived_only=False)
+    sources = ("claude", "codex", "pi") if source_name == "all" else (source_name,)
+    placeholders = ",".join("?" for _source in sources)
+    scanned = conn.execute(
+        f"""
+        WITH sessions AS (
+            SELECT d.source,
+                   d.session_id,
+                   MAX(COALESCE(d.ts, 0)) AS last_user_ts
+            FROM documents d
+            LEFT JOIN session_archive_status archive
+              ON archive.source = d.source
+             AND archive.session_id = d.session_id
+            WHERE d.source IN ({placeholders})
+              AND d.role = 'user'
+              AND TRIM(COALESCE(d.text, '')) != ''
+              AND d.path NOT LIKE '%/subagents/%'
+              AND COALESCE(archive.archived, 0) = 0
+            GROUP BY d.source, d.session_id
+            ORDER BY last_user_ts DESC
+            LIMIT ?
+        ),
+        latest_user_rows AS (
+            SELECT sessions.last_user_ts,
+                   d.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY d.source, d.session_id
+                       ORDER BY COALESCE(d.ts, 0) DESC, d.doc_id DESC
+                   ) AS row_rank
+            FROM sessions
+            JOIN documents d
+              ON d.source = sessions.source
+             AND d.session_id = sessions.session_id
+            WHERE d.role = 'user'
+              AND TRIM(COALESCE(d.text, '')) != ''
+        )
+        SELECT latest_user_rows.*,
+               cards.repo AS cached_repo,
+               cards.last_active AS cached_last_active,
+               cards.what_this_was AS cached_about
+        FROM latest_user_rows
+        LEFT JOIN session_cards cards
+          ON cards.source = latest_user_rows.source
+         AND cards.session_id = latest_user_rows.session_id
+        WHERE latest_user_rows.row_rank = 1
+        ORDER BY latest_user_rows.last_user_ts DESC
+        """,
+        [*sources, scan_limit],
+    ).fetchall()
     groups: dict[str, dict[str, Any]] = {}
-    for row, _score, _label in scanned:
-        card = ss.session_card_for_result(conn, row, "", persist=False, use_llm=False)
-        rows = ss.session_rows(conn, row)
-        about, _state, _resume, _clue = ss.dashboard_summary(card, rows, row)
-        repo = card.repo or ss.location_label(row)
+    for row in scanned:
+        repo = str(row["cached_repo"] or "") or ss.location_label(row)
         project = ss.dashboard_project_label(repo)
         if ss.dashboard_project_is_noise(project, repo):
             continue
+        about = ss.clean_card_line(str(row["cached_about"] or ""), 160)
+        if not about:
+            title = ss.clean_card_line(str(row["title"] or ""), 160)
+            if title and not ss.is_weak_title(title):
+                about = title
+            else:
+                about = ss.clean_card_line(str(row["text"] or "")[:500], 160)
+        last_active = max(
+            int(row["last_user_ts"] or 0),
+            int(row["cached_last_active"] or 0),
+        )
         bucket = groups.setdefault(
             project,
             {
                 "project": project,
                 "count": 0,
-                "latest_ts": card.last_active or 0,
+                "latest_ts": last_active,
                 "latest_about": about,
-                "latest_session_id": card.session_id,
-                "latest_source": card.source,
+                "latest_session_id": str(row["session_id"]),
+                "latest_source": str(row["source"]),
                 "repo": repo,
             },
         )
         bucket["count"] += 1
-        ts = card.last_active or 0
+        ts = last_active
         if ts >= int(bucket["latest_ts"] or 0):
             bucket["latest_ts"] = ts
             bucket["latest_about"] = about
-            bucket["latest_session_id"] = card.session_id
-            bucket["latest_source"] = card.source
+            bucket["latest_session_id"] = str(row["session_id"])
+            bucket["latest_source"] = str(row["source"])
             bucket["repo"] = repo
     ordered = sorted(
         groups.values(),

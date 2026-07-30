@@ -203,10 +203,22 @@ class DashboardWorkMapContracts(unittest.TestCase):
             resume="Price the next lot",
             ts=50,
         )
-        projects = ss.dashboard_project_summaries(self.conn, source_name="all", thread_limit=3)
+        with mock.patch.object(
+            ss,
+            "session_card_for_result",
+            side_effect=AssertionError("project footer rebuilt a full session card"),
+        ):
+            projects = ss.dashboard_project_summaries(
+                self.conn,
+                source_name="all",
+                thread_limit=3,
+            )
         names = [item["project"] for item in projects]
         self.assertIn("Agency / Lakeside Clinic", names)
         self.assertIn("Robots", names)
+        robots = next(item for item in projects if item["project"] == "Robots")
+        self.assertEqual(robots["count"], 1)
+        self.assertIn("Robots battery", robots["latest_about"])
 
     def test_older_project_summary_wraps_without_truncation(self) -> None:
         _seed_session(
