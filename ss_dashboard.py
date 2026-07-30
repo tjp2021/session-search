@@ -15,7 +15,10 @@ import re
 import shutil
 import sqlite3
 import sys
+import unicodedata
 from typing import Any, Iterator
+from wcwidth import wcwidth, wcswidth
+
 from card_quality import quality_gate
 
 import session_search as ss
@@ -99,7 +102,7 @@ def dashboard_terminal_width() -> int:
         width = int(shutil.get_terminal_size(fallback=(100, 24)).columns)
     except (TypeError, ValueError, OSError):
         width = 100
-    return max(60, min(width, 200))
+    return max(32, min(width, 200))
 
 
 def dashboard_clean_text(value: str) -> str:
@@ -682,7 +685,9 @@ def catch_up_dashboard_cards(
     if candidates and not ss.llm_available():
         ss.warn_llm_unavailable()
     if candidates and not quiet:
-        print(f"Refreshing {len(candidates)} recent session summaries...")
+        refresh_line = f"Refreshing {len(candidates)} recent session summaries..."
+        for line in dashboard_wrapped_lines(refresh_line, ss.dashboard_terminal_width()):
+            print(line)
         sys.stdout.flush()
 
     stored = 0
@@ -777,45 +782,61 @@ def print_dashboard(
             more_projects.append(item)
         more_projects = more_projects[:8]
 
-    print(f"{len(thread_entries)} recent thread{'s' if len(thread_entries) != 1 else ''} · open with: ss open N")
+    count_line = f"{len(thread_entries)} recent thread{'s' if len(thread_entries) != 1 else ''} · open with: ss open N"
+    for line in dashboard_wrapped_lines(count_line, width):
+        print(line)
     print()
 
-    body_width = max(28, width - 2)
+    card_width = min(width, 112)
     for project_name, items in groups:
         latest = items[0]
         header = f"{project_name}  ·  {latest['when']}  ·  {len(items)} shown"
-        print(ss.dashboard_cell(header, width))
+        for line in dashboard_wrapped_lines(header, width):
+            print(line)
         # Keep one short folder line only when it adds information.
         folder = ss.repo_label(latest["repo"])
         if folder and folder not in {"unknown", "unknown from index"}:
-            print(ss.dashboard_cell(f"  {folder}", width))
+            for line in dashboard_wrapped_lines(folder, max(1, width - 2)):
+                print(f"  {line}")
         for entry in items:
             tool = ss.dashboard_short_tool(str(entry["source"]))
             marker = " [ARCHIVED]" if entry["archived"] and "[ARCHIVED]" not in project_name else ""
             print()
-            print(ss.dashboard_cell(f"  {entry['rank']}. {tool}{marker} · {entry['when']}", width))
             about = entry["about"] or "Untitled session."
             state = entry["state"] or "No clear completed work found in local evidence."
             resume = entry["resume"] or "No clear next step found in local evidence."
-            # Keep literal "About"/"State"/"Resume" markers for behavior contracts and muscle memory.
-            print(ss.dashboard_cell("     " + f"About: {about}", body_width))
-            print(ss.dashboard_cell("     " + f"State: {state}", body_width))
-            print(ss.dashboard_cell("     " + f"Resume: {resume}", body_width))
+            fields = [
+                ("About:", about),
+                ("State:", state),
+                ("Resume:", resume),
+            ]
             if entry["clue"] and not entry["clue"].lower().startswith("key terms:"):
-                print(ss.dashboard_cell("     " + f"Clue: {entry['clue']}", body_width))
-            print(f"     Open: ss open {entry['rank']}")
+                fields.append(("Clue:", entry["clue"]))
+            fields.append(("Open:", f"ss open {entry['rank']}"))
+            title_line = f"{entry['rank']} · {tool}{marker} · {entry['when']}"
+            for line in dashboard_restart_card_lines(title_line, fields, card_width):
+                print(line)
         print()
 
     if more_projects:
         print("Older projects still saved:")
         for item in more_projects:
             when = ss.dashboard_relative_time(item.get("latest_ts"))
-            about = ss.dashboard_cell(str(item.get("latest_about") or ""), max(20, width - 36))
-            print(ss.dashboard_cell(f"  - {item['project']} · {when} · {item.get('count', 0)} threads · {about}", width))
-        print("  Search one: ss <words>    See finished: ss archived")
+            summary = (
+                f"- {item['project']} · {when} · {item.get('count', 0)} threads · "
+                f"{item.get('latest_about') or 'No summary available.'}"
+            )
+            for line in dashboard_wrapped_lines(summary, max(1, width - 2)):
+                print(f"  {line}")
+        for line in dashboard_wrapped_lines("Search one: ss <words> · See finished: ss archived", max(1, width - 2)):
+            print(f"  {line}")
         print()
 
-    print("ss <search> · ss open N · ss look at N · ss archive N · ss archived")
+    for line in dashboard_wrapped_lines(
+        "ss <search> · ss open N · ss look at N · ss archive N · ss archived",
+        width,
+    ):
+        print(line)
 
 
 def dashboard_cell(value: str, width: int) -> str:
@@ -825,6 +846,145 @@ def dashboard_cell(value: str, width: int) -> str:
     if len(clean) <= width:
         return clean
     return clean[: max(1, width - 1)].rstrip() + "…"
+
+
+def dashboard_wrapped_lines(value: str, width: int) -> list[str]:
+    """Wrap terminal copy without discarding words."""
+    clean = ss.dashboard_clean_text(value)
+    if not clean:
+        return [""]
+    line_width = max(1, int(width))
+    lines: list[str] = []
+    current = ""
+    for word in clean.split():
+        candidate = word if not current else f"{current} {word}"
+        if dashboard_display_width(candidate) <= line_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        if dashboard_display_width(word) <= line_width:
+            current = word
+            continue
+        chunks = _dashboard_split_display_chunks(word, line_width)
+        lines.extend(chunks[:-1])
+        current = chunks[-1]
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def dashboard_display_width(value: str) -> int:
+    """Return the terminal cell width of Unicode text."""
+    measured = wcswidth(value)
+    if measured >= 0:
+        return measured
+    return sum(max(0, wcwidth(char)) for char in value)
+
+
+def _dashboard_split_display_chunks(value: str, width: int) -> list[str]:
+    """Split only an unbroken token that cannot fit on one line."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_width = 0
+    for cluster in _dashboard_grapheme_clusters(value):
+        cluster_width = dashboard_display_width(cluster)
+        if current and current_width + cluster_width > width:
+            chunks.append("".join(current).rstrip())
+            current = []
+            current_width = 0
+            if cluster.isspace():
+                continue
+        current.append(cluster)
+        current_width += cluster_width
+    if current:
+        chunks.append("".join(current).rstrip())
+    return chunks or [""]
+
+
+def _dashboard_grapheme_clusters(value: str) -> list[str]:
+    """Keep common joined Unicode sequences intact during emergency splits."""
+    clusters: list[str] = []
+    current = ""
+    regional_count = 0
+    for char in value:
+        codepoint = ord(char)
+        is_regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+        is_extension = (
+            unicodedata.category(char).startswith("M")
+            or 0xFE00 <= codepoint <= 0xFE0F
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or 0xE0020 <= codepoint <= 0xE007F
+        )
+        if not current:
+            current = char
+            regional_count = 1 if is_regional else 0
+            continue
+        if char == "\u200d" or current.endswith("\u200d") or is_extension:
+            current += char
+            continue
+        if is_regional and regional_count == 1:
+            current += char
+            regional_count = 0
+            continue
+        clusters.append(current)
+        current = char
+        regional_count = 1 if is_regional else 0
+    if current:
+        clusters.append(current)
+    return clusters
+
+
+def dashboard_restart_card_lines(
+    title: str,
+    fields: list[tuple[str, str]],
+    width: int,
+) -> list[str]:
+    """Render one complete restart card within the requested terminal width."""
+    card_width = max(12, int(width))
+    narrow = card_width < 40
+    top_left, horizontal, top_right = ("+", "-", "+") if narrow else ("┌", "─", "┐")
+    bottom_left, bottom_right, vertical = ("+", "+", "|") if narrow else ("└", "┘", "│")
+    inner_width = card_width - 4
+    clean_title = ss.dashboard_clean_text(title)
+
+    lines: list[str] = []
+    title_room = card_width - 6
+    if clean_title and dashboard_display_width(clean_title) <= title_room:
+        remaining = card_width - dashboard_display_width(clean_title) - 5
+        lines.append(f"{top_left}{horizontal} {clean_title} {horizontal * remaining}{top_right}")
+    else:
+        lines.append(f"{top_left}{horizontal * (card_width - 2)}{top_right}")
+
+    def bordered(content: str) -> str:
+        padding = max(0, inner_width - dashboard_display_width(content))
+        return f"{vertical} {content}{' ' * padding} {vertical}"
+
+    if clean_title and dashboard_display_width(clean_title) > title_room:
+        for part in dashboard_wrapped_lines(clean_title, inner_width):
+            lines.append(bordered(part))
+
+    stacked_fields = card_width < 52
+    for label, value in fields:
+        clean_value = ss.dashboard_clean_text(value)
+        if stacked_fields:
+            lines.append(bordered(label))
+            body_width = max(1, inner_width - 2)
+            for part in dashboard_wrapped_lines(clean_value, body_width):
+                lines.append(bordered(f"  {part}"))
+            continue
+
+        prefix = f"{label} "
+        body_width = max(1, inner_width - len(prefix))
+        wrapped = dashboard_wrapped_lines(clean_value, body_width)
+        lines.append(bordered(prefix + wrapped[0]))
+        continuation = " " * len(prefix)
+        for part in wrapped[1:]:
+            lines.append(bordered(continuation + part))
+
+    lines.append(f"{bottom_left}{horizontal * (card_width - 2)}{bottom_right}")
+    return lines
 
 
 def dashboard_project_label(repo: str) -> str:

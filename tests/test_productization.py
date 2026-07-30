@@ -12,6 +12,7 @@ import adapter_capabilities
 import card_quality
 import session_search as ss
 import ss_config
+import ss_dashboard
 
 
 class PortableConfigurationTest(unittest.TestCase):
@@ -21,6 +22,39 @@ class PortableConfigurationTest(unittest.TestCase):
             payload = tomllib.load(handle)
         self.assertEqual(payload["project"]["scripts"]["ss"], "session_search:main")
         self.assertEqual(payload["project"]["requires-python"], ">=3.11")
+        self.assertIn("wcwidth>=0.2,<1", payload["project"]["dependencies"])
+
+    def test_readme_documents_the_unpinned_design_partner_install(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        with (root / "pyproject.toml").open("rb") as handle:
+            payload = tomllib.load(handle)
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        repository = payload["project"]["urls"]["Repository"]
+        install = (
+            f'pipx install "{payload["project"]["name"]}[semantic] '
+            f'@ git+{repository}.git"'
+        )
+        self.assertIn(install, readme)
+        self.assertIn("not version-pinned", readme)
+        self.assertIn("ss capabilities", readme)
+        self.assertIn("ss demo", readme)
+
+    def test_readme_hero_card_matches_the_terminal_renderer(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        rendered = "\n".join(
+            ss_dashboard.dashboard_restart_card_lines(
+                "5 · Codex · 3d ago",
+                [
+                    ("About:", "Update the robot battery pricing page."),
+                    ("State:", "The pricing table is complete."),
+                    ("Resume:", "Verify the mobile layout."),
+                    ("Open:", "ss open 5"),
+                ],
+                64,
+            )
+        )
+        self.assertIn(f"```text\n{rendered}\n```", readme)
 
     def test_every_facade_concern_module_ships_with_the_package(self):
         # Derived from the facade's own imports, not restated as a list. A

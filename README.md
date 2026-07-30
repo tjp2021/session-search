@@ -1,51 +1,83 @@
-# SS
+# Session Search
 
-SS finds, understands, reopens, and organizes your local Claude Code, Codex,
-Pi, VS Code/Copilot, and Cursor sessions.
+## Recover the state, not only the transcript
 
-Use it when a terminal restarted, a session disappeared, or you remember the
-work but not which AI tool or folder contained it.
+You remember the work, but not the session. It may be in Claude Code, Codex,
+another terminal, or a repository you have not opened all week.
 
-Everything runs on your machine by default: indexing, search, ranking, and
-the session cards. One optional feature changes that. When you explicitly turn
-on model summaries, building a card sends session text to OpenRouter. It's off
-until you opt in. See [What leaves your machine](#what-leaves-your-machine).
+Session Search lets you type what you remember. It searches your local AI
+coding history. From local evidence, it reconstructs the best visible stopping
+point and gives you the command to reopen or continue the work.
+
+```bash
+ss what was I doing with the robots battery pricing
+```
+
+```text
+┌─ 5 · Codex · 3d ago ─────────────────────────────────────────┐
+│ About: Update the robot battery pricing page.                │
+│ State: The pricing table is complete.                        │
+│ Resume: Verify the mobile layout.                            │
+│ Open: ss open 5                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Session Search is built for Mac developers who use Claude Code and Codex
+across many repositories. It also reads Pi sessions. VS Code/Copilot and
+Cursor support is partial, and exact native reopening is not available for
+those two sources.
+
+The proof is public: the [case study](docs/case-study.md),
+[retrieval benchmark](#published-evidence),
+[privacy tests](tests/test_secret_redaction.py), and
+[current CI results](../../actions) ship with the repository.
+
+Indexing, search, ranking, and evidence-based session cards run on your Mac.
+Optional model summaries send selected session text to OpenRouter only after
+you turn on two settings. See
+[What leaves your machine](#what-leaves-your-machine).
 
 ## Install
 
-SS supports macOS and Python 3.11 or newer.
-
-Install the current release from GitHub:
+Session Search supports macOS and Python 3.11 or newer. This design-partner
+command installs the latest public `main` branch from GitHub:
 
 ```bash
 pipx install "session-search[semantic] @ git+https://github.com/tjp2021/session-search.git"
 ```
 
-The semantic extra installs the local embedding backend. SS still supports
-full-text and fuzzy search when that extra isn't installed.
+This command is not version-pinned. The first semantic search can download the
+local model and take longer. Use the smaller base install when you want to
+start without that model:
+
+```bash
+pipx install "session-search @ git+https://github.com/tjp2021/session-search.git"
+```
+
+Without the `semantic` option, Session Search still supports exact-word and
+typo-tolerant search.
 
 Confirm the installation:
 
 ```bash
-ss --help
 ss capabilities
 ss demo
 ```
 
-`ss demo` creates a temporary database containing 120 synthetic records. It
-doesn't read your real session history, and it removes the temporary data when
-finished.
+`ss demo` proves the installed command without reading your history. It creates
+120 fictional records in a temporary database, exercises search and archive
+behavior, and removes the data when finished.
 
-## Start here
+## Recover your first session
 
-Run this from any folder:
+Describe something distinctive that you remember:
 
 ```bash
-ss
+ss fresh robots battery pricing
 ```
 
-SS shows the most recent active sessions across all indexed folders. Each
-result explains:
+`fresh` scans the local archives before searching, so its first run can take
+longer on a large history. Each result explains:
 
 - `About`: what the session concerned.
 - `State`: what happened or where the work stands.
@@ -60,8 +92,11 @@ If the right session is number 4:
 ss open 4
 ```
 
-That's the normal workflow: run `ss`, identify the session, then open its
-number.
+That's the recovery loop: describe the work, inspect the evidence, and open the
+result number.
+
+Run `ss` without search words when you want the most recent active sessions
+instead.
 
 Inside the interactive dashboard, you can also:
 
@@ -279,8 +314,8 @@ FastEmbed and cached under:
 ~/Library/Application Support/session-search/models/
 ```
 
-Run this after a large refresh when you want to backfill missing semantic
-vectors:
+Run this after a large refresh when you want to build any missing
+meaning-search records:
 
 ```bash
 ss embed
@@ -288,8 +323,9 @@ ss embed
 
 ## What leaves your machine
 
-Nothing, by default. Session cards are built from local evidence and no
-network call is ever made.
+No session content leaves your Mac by default. Session cards use local
+evidence. FastEmbed can download its model during the first semantic search,
+but it doesn't upload your session text.
 
 Model summaries are the opt-in exception. They make "About" lines noticeably
 better, and they work by sending session text to OpenRouter. Both switches
@@ -394,14 +430,23 @@ queries. On the recorded macOS benchmark:
 
 | Mode | Top-one accuracy | Recall at five | MRR at ten |
 | --- | ---: | ---: | ---: |
-| FTS | 60.00% | 61.25% | 0.606 |
+| Exact words (FTS) | 60.00% | 61.25% | 0.606 |
 | Local fuzzy | 68.75% | 70.00% | 0.694 |
-| Hybrid | 90.00% | 95.00% | 0.918 |
+| Combined local search | 90.00% | 95.00% | 0.918 |
 
-At 1,000 synthetic sessions, hybrid query latency measured 191 ms p50 and 220
-ms p95 after the local embeddings were built. Cold indexing took 105 ms,
-incremental refresh took 196 ms, and the one-time embedding build took 6.8
-seconds.
+Top-one accuracy means the correct session appeared first. The combined search
+did that for 72 of 80 queries. Recall at five means the correct session
+appeared within the first five results. It did that for 76 of 80 queries. MRR
+at ten rewards putting the right answer nearer the top of the first ten.
+
+At 1,000 synthetic sessions, half of combined searches finished within 191
+milliseconds. Ninety-five percent finished within 220 milliseconds after the
+local meaning index existed. The first text index took 105 milliseconds. An
+incremental refresh took 196 milliseconds. Building the meaning index once took
+6.8 seconds.
+
+These synthetic measurements provide a repeatable regression baseline. They
+don't predict the exact speed or accuracy of every real archive or Mac.
 
 The versioned source data is in `evidence/`. Run it again with:
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "session-search"
 version = "0.2.0"
-description = "Local search and recovery across AI coding sessions"
+description = "Recover lost work across Claude Code and Codex sessions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -20,9 +20,9 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
-  "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Topic :: Utilities",
 ]
-dependencies = []
+dependencies = ["wcwidth>=0.2,<1"]
 
 [project.optional-dependencies]
 semantic = ["fastembed>=0.7,<0.8"]
@@ -33,7 +33,9 @@ ss = "session_search:main"
 sessions = "session_search:main"
 
 [project.urls]
+Homepage = "https://github.com/tjp2021/session-search"
 Repository = "https://github.com/tjp2021/session-search"
+Issues = "https://github.com/tjp2021/session-search/issues"
 
 [tool.setuptools]
 py-modules = [

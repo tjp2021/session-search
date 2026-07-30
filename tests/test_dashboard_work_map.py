@@ -6,11 +6,14 @@ import argparse
 import contextlib
 import io
 import pathlib
+import re
 import tempfile
 import unittest
 from unittest import mock
+from wcwidth import wcswidth
 
 import session_search as ss
+import ss_dashboard as dashboard
 
 
 def _seed_session(
@@ -205,6 +208,44 @@ class DashboardWorkMapContracts(unittest.TestCase):
         self.assertIn("Agency / Lakeside Clinic", names)
         self.assertIn("Robots", names)
 
+    def test_older_project_summary_wraps_without_truncation(self) -> None:
+        _seed_session(
+            self.conn,
+            source="codex",
+            session_id="visible",
+            cwd="/Users/alex/workspace/os/research/visible",
+            title="Visible",
+            about="Current work",
+            state="Current state",
+            resume="Continue",
+            ts=200,
+        )
+        results = ss.recent_session_results(self.conn, 1, "all")
+        older = [
+            {
+                "project": "Robots",
+                "repo": "/Users/alex/workspace/os/robots",
+                "latest_ts": 100,
+                "count": 3,
+                "latest_about": (
+                    "Compare every remaining battery pack before publishing "
+                    "the complete resale inventory."
+                ),
+            }
+        ]
+        out = io.StringIO()
+        with (
+            mock.patch.object(ss, "dashboard_terminal_width", return_value=40),
+            contextlib.redirect_stdout(out),
+        ):
+            ss.print_dashboard(self.conn, results, project_summaries=older)
+        rendered = out.getvalue()
+        self.assertIn("Older projects still saved:", rendered)
+        self.assertNotIn("…", rendered)
+        for word in "Compare remaining battery publishing complete inventory".split():
+            self.assertIn(word, rendered)
+        self.assertTrue(all(wcswidth(line) <= 40 for line in rendered.splitlines()))
+
     def test_open_numbers_match_saved_selector_order(self) -> None:
         for index, name in enumerate(("alpha", "beta", "gamma"), start=1):
             _seed_session(
@@ -291,6 +332,106 @@ class DashboardWorkMapContracts(unittest.TestCase):
             text = out.getvalue()
             for line in text.splitlines():
                 self.assertLessEqual(len(line), width + 5, msg=line)
+
+    def test_restart_cards_wrap_every_field_without_losing_words(self) -> None:
+        fields = [
+            ("About:", "Recover the forgotten deployment notes and 日本語 labels from the original agent session."),
+            ("State:", "The parser indexed every message and retained the final verified decision."),
+            ("Resume:", "Compare the staging output before publishing the repaired package."),
+            ("Clue:", "Path: references/release-validation-checklist.md"),
+            ("Open:", "ss open 7"),
+        ]
+        expected_words = {
+            word
+            for _label, value in fields
+            for word in value.replace("/", " ").replace(".", "").split()
+        }
+        for width in (32, 39, 40, 51, 52, 80, 112, 160):
+            with self.subTest(width=width):
+                lines = dashboard.dashboard_restart_card_lines(
+                    "7 · Claude 👩🏽‍💻 · 12m ago",
+                    fields,
+                    width,
+                )
+                rendered = "\n".join(lines)
+                normalized = re.sub(r"[\s│|┌┐└┘+\-─]", "", rendered)
+                for word in expected_words - {"release-validation-checklistmd"}:
+                    self.assertIn(word, rendered.replace("/", " ").replace(".", ""))
+                self.assertIn("releasevalidationchecklist.md", normalized)
+                self.assertNotIn("…", rendered)
+                self.assertTrue(all(wcswidth(line) == width for line in lines))
+                self.assertIn("7 · Claude", rendered)
+                self.assertIn("👩🏽‍💻", rendered)
+                self.assertIn("ss open 7", rendered)
+
+    def test_dashboard_uses_bordered_restart_cards_and_complete_wrapped_copy(self) -> None:
+        _seed_session(
+            self.conn,
+            source="claude",
+            session_id="wrapped",
+            cwd="/Users/alex/workspace/os/_shared/session-search",
+            title="Wrapped recovery",
+            about="placeholder about",
+            state="placeholder state",
+            resume="placeholder resume",
+            ts=100,
+        )
+        results = ss.recent_session_results(self.conn, 5, "all")
+        fields = (
+            "Recover the forgotten deployment notes from the original agent session.",
+            "The parser indexed every message and retained the final verified decision.",
+            "Compare the staging output before publishing the repaired package.",
+            "Path: references/release-validation-checklist.md",
+        )
+        out = io.StringIO()
+        with (
+            mock.patch.object(ss, "dashboard_terminal_width", return_value=64),
+            mock.patch.object(ss, "dashboard_summary", return_value=fields),
+            contextlib.redirect_stdout(out),
+        ):
+            ss.print_dashboard(self.conn, results)
+        rendered = out.getvalue()
+        self.assertIn("┌─ 1 · Claude", rendered)
+        self.assertIn("└" + ("─" * 62) + "┘", rendered)
+        self.assertIn("Open: ss open 1", rendered)
+        self.assertNotIn("…", rendered)
+        for word in "forgotten deployment original retained verified staging repaired validation".split():
+            self.assertIn(word, rendered)
+        self.assertTrue(all(len(line) <= 64 for line in rendered.splitlines()))
+
+    def test_oversized_token_keeps_joined_emoji_intact(self) -> None:
+        token = ("a" * 24) + "👩🏽‍💻" + ("b" * 8)
+        lines = dashboard.dashboard_wrapped_lines(token, 26)
+        self.assertEqual("".join(lines), token)
+        self.assertTrue(any("👩🏽‍💻" in line for line in lines))
+        self.assertFalse(any(line.endswith("👩") for line in lines))
+        self.assertTrue(all(wcswidth(line) <= 26 for line in lines))
+
+    def test_narrow_dashboard_uses_safe_ascii_card(self) -> None:
+        _seed_session(
+            self.conn,
+            source="codex",
+            session_id="narrow",
+            cwd="/Users/alex/workspace/os/research/narrow",
+            title="Narrow recovery",
+            about="Recover a narrow terminal session",
+            state="All source evidence remains available",
+            resume="Open the exact original session",
+            ts=100,
+        )
+        results = ss.recent_session_results(self.conn, 5, "all")
+        out = io.StringIO()
+        with (
+            mock.patch.object(ss, "dashboard_terminal_width", return_value=34),
+            contextlib.redirect_stdout(out),
+        ):
+            ss.print_dashboard(self.conn, results)
+        rendered = out.getvalue()
+        self.assertIn("+--------------------------------+", rendered)
+        self.assertIn("1 · Codex", rendered)
+        self.assertIn("ss open 1", rendered)
+        self.assertIn("About:", rendered)
+        self.assertTrue(all(len(line) <= 34 for line in rendered.splitlines()))
 
     def test_unicode_and_missing_folder_do_not_crash(self) -> None:
         _seed_session(
