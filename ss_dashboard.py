@@ -1169,6 +1169,7 @@ def dashboard_prompt(args: argparse.Namespace) -> int:
                     db=args.db,
                     home=args.home,
                     project=str(project_choices[project_index]["project"]),
+                    project_choices=project_choices,
                     limit=200,
                     source=args.source,
                     mode=args.mode,

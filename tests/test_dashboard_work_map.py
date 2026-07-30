@@ -339,6 +339,10 @@ class DashboardWorkMapContracts(unittest.TestCase):
         )
 
     def test_interactive_project_selector_opens_its_bucket(self) -> None:
+        project_choices = [
+            {"project": "Personal"},
+            {"project": "Shared / Osmo"},
+        ]
         args = argparse.Namespace(
             db=str(self.db),
             home=str(self.home),
@@ -346,15 +350,51 @@ class DashboardWorkMapContracts(unittest.TestCase):
             source="all",
             mode="hybrid",
             no_refresh=True,
-            project_choices=[{"project": "Shared / Osmo"}],
+            project_choices=project_choices,
         )
         with (
             mock.patch.object(ss, "dashboard_is_interactive", return_value=True),
-            mock.patch("builtins.input", return_value="p1"),
+            mock.patch("builtins.input", return_value="p2"),
             mock.patch.object(ss, "cmd_project", return_value=0) as project,
         ):
             self.assertEqual(ss.dashboard_prompt(args), 0)
         self.assertEqual(project.call_args.args[0].project, "Shared / Osmo")
+        self.assertEqual(project.call_args.args[0].project_choices, project_choices)
+
+    def test_project_command_keeps_parent_selectors_for_another_choice(self) -> None:
+        _seed_session(
+            self.conn,
+            source="codex",
+            session_id="personal-1",
+            cwd="/Users/alex/workspace/os/personal",
+            title="Personal",
+            about="Personal work",
+            state="Prepared evidence",
+            resume="Continue the work",
+            ts=100,
+        )
+        project_choices = [
+            {"project": "Personal"},
+            {"project": "Shared / Osmo"},
+        ]
+        args = argparse.Namespace(
+            db=str(self.db),
+            home=str(self.home),
+            project="Personal",
+            project_choices=project_choices,
+            limit=200,
+            source="all",
+            mode="hybrid",
+            no_refresh=True,
+        )
+        with (
+            mock.patch.object(ss, "save_last_results"),
+            mock.patch.object(ss, "dashboard_prompt", return_value=0) as prompt,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(ss.cmd_project(args), 0)
+
+        self.assertEqual(prompt.call_args.args[0].project_choices, project_choices)
 
     def test_direct_project_command_routes_to_project_view(self) -> None:
         with mock.patch.object(ss, "cmd_project", return_value=0) as project:

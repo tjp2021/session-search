@@ -61,6 +61,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 def cmd_project(args: argparse.Namespace) -> int:
     raw_name = getattr(args, "project", "")
     project_name = " ".join(raw_name) if isinstance(raw_name, list) else str(raw_name)
+    project_choices = list(getattr(args, "project_choices", []) or [])
     with ss.session_lock(shared=False):
         db_path = ss.expand(args.db)
         if not db_path.exists():
@@ -86,7 +87,8 @@ def cmd_project(args: argparse.Namespace) -> int:
             heading=f"SS project · {canonical_name}",
         )
         conn.close()
-    args.project_choices = []
+    # Keep the parent dashboard map so P2 still works after P1 opens.
+    args.project_choices = project_choices
     args.home = getattr(args, "home", "~")
     args.no_refresh = True
     args.limit = max(200, int(getattr(args, "limit", 200)))
