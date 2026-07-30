@@ -41,6 +41,8 @@ tests/test_fault_reliability.py
 tests/test_natural_parser.py
 tests/test_productization.py
 tests/test_behavior_contracts.py
+tests/test_dashboard_summary_quality.py
+tests/test_dashboard_work_map.py
 tests/test_public_card_quality.py
 tests/test_retrieval_metrics.py
 uv.lock
