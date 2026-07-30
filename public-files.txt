@@ -42,6 +42,7 @@ tests/benchmark_archive.py
 tests/benchmark_public.py
 tests/run_public_card_quality_eval.py
 tests/run_public_retrieval_eval.py
+tests/test_adapter_pipeline.py
 tests/test_archive_concurrency.py
 tests/test_archive_intent.py
 tests/test_behavior_contracts.py

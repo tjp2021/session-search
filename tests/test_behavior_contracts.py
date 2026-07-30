@@ -1,6 +1,5 @@
 import argparse
 import contextlib
-import inspect
 import io
 import pathlib
 import tempfile
@@ -39,17 +38,74 @@ class DashboardBehaviorContracts(unittest.TestCase):
             projects.assert_called_once()
 
     def test_dashboard_keeps_about_state_and_resume(self):
-        # Resolve the source from the function itself so the contract follows
-        # print_dashboard wherever the facade split places it.
-        dashboard = inspect.getsource(ss.print_dashboard)
-        self.assertTrue(
-            'About: {about}' in dashboard or 'f"About: {about}"' in dashboard or "About: {about}" in dashboard
-        )
-        self.assertTrue('State: {state}' in dashboard or 'f"State: {state}"' in dashboard)
-        self.assertTrue('Resume: {resume}' in dashboard or 'f"Resume: {resume}"' in dashboard)
-        # Restart screen identity markers.
-        self.assertIn('print(title)', dashboard)
-        self.assertIn('ss open N', dashboard)
+        # Render a real dashboard from an indexed document and assert the
+        # output. The old version grepped print_dashboard's source text, which
+        # could not fail on a behavior regression.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_lock = ss.DEFAULT_LOCK
+            ss.DEFAULT_LOCK = str(pathlib.Path(tmpdir) / "session-search.lock")
+            try:
+                conn = ss.connect_db(pathlib.Path(tmpdir) / "contract.sqlite")
+                ss.init_db(conn)
+                ss.upsert_documents(
+                    conn,
+                    [
+                        ss.Document(
+                            doc_id="contract:doc-1",
+                            source="claude",
+                            session_id="contract-session",
+                            title="Rebuild the exporter",
+                            path="/tmp/contract/session.jsonl",
+                            cwd="/tmp/contract-repo",
+                            role="user",
+                            ts=ss.now_ts() - 120,
+                            text="Rebuild the exporter so the nightly sync stops dropping rows.",
+                            meta={},
+                        ),
+                        ss.Document(
+                            doc_id="contract:doc-2",
+                            source="claude",
+                            session_id="contract-session",
+                            title="Rebuild the exporter",
+                            path="/tmp/contract/session.jsonl",
+                            cwd="/tmp/contract-repo",
+                            role="assistant",
+                            ts=ss.now_ts() - 90,
+                            text="Updated the exporter so it writes every row without drops.",
+                            meta={},
+                        ),
+                        ss.Document(
+                            doc_id="contract:doc-3",
+                            source="claude",
+                            session_id="contract-session",
+                            title="Rebuild the exporter",
+                            path="/tmp/contract/session.jsonl",
+                            cwd="/tmp/contract-repo",
+                            role="user",
+                            ts=ss.now_ts() - 60,
+                            text="Next, run the nightly sync against the production snapshot.",
+                            meta={},
+                        ),
+                    ],
+                )
+                results = ss.recent_session_results(conn, 5)
+                self.assertTrue(results, "the indexed document must appear as a recent session")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    ss.print_dashboard(conn, results)
+                conn.close()
+            finally:
+                ss.DEFAULT_LOCK = old_lock
+        rendered = out.getvalue()
+        self.assertTrue(rendered.startswith("SS\n"), "the restart screen must open with its title line")
+        self.assertIn("About: ", rendered)
+        self.assertIn("State: ", rendered)
+        self.assertIn("Resume: ", rendered)
+        self.assertIn("State: Updated the exporter so it writes every row without drops.", rendered)
+        self.assertIn("Resume: Next, run the nightly sync against the production snapshot.", rendered)
+        self.assertIn("open with: ss open N", rendered)
+        self.assertIn("Open: ss open 1", rendered)
+        self.assertIn("exporter", rendered, "the session's own content must reach the About surface")
 
 
 if __name__ == "__main__":

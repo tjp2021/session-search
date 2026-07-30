@@ -126,15 +126,18 @@ def cmd_index(args: argparse.Namespace) -> int:
         db_path = ss.expand(args.db)
         home = ss.expand(args.home)
         conn = ss.connect_db(db_path)
-        if args.reset:
-            ss.reset_db(conn)
-        else:
-            ss.init_db(conn)
-        sources = ss.normalize_sources(args.source)
-        count = ss.upsert_documents(conn, ss.build_docs(home, sources))
-        ss.sync_detected_archive_states(conn)
-        if not args.quiet:
-            print(f"Indexed {count} documents into {db_path}")
+        try:
+            if args.reset:
+                ss.reset_db(conn)
+            else:
+                ss.init_db(conn)
+            sources = ss.normalize_sources(args.source)
+            count = ss.upsert_documents(conn, ss.build_docs(home, sources))
+            ss.sync_detected_archive_states(conn)
+            if not args.quiet:
+                print(f"Indexed {count} documents into {db_path}")
+        finally:
+            conn.close()
     return 0
 
 
@@ -188,14 +191,17 @@ def cmd_search(args: argparse.Namespace) -> int:
             print("Run: python3 session_search.py index --reset", file=sys.stderr)
             return 2
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
-        if not getattr(args, "no_refresh", False):
-            ss.refresh_dashboard_index(conn, ss.expand(getattr(args, "home", "~")))
-        else:
-            ss.sync_detected_archive_states(conn)
-        display_query, results = ss.run_search(conn, args.query, args.limit, args.source, args.mode)
-        ss.save_last_results(results, display_query, db_path)
-        ss.print_results(conn, results, display_query)
+        try:
+            ss.init_db(conn)
+            if not getattr(args, "no_refresh", False):
+                ss.refresh_dashboard_index(conn, ss.expand(getattr(args, "home", "~")))
+            else:
+                ss.sync_detected_archive_states(conn)
+            display_query, results = ss.run_search(conn, args.query, args.limit, args.source, args.mode)
+            ss.save_last_results(results, display_query, db_path)
+            ss.print_results(conn, results, display_query)
+        finally:
+            conn.close()
     return 0
 
 
@@ -287,52 +293,55 @@ def cmd_handoff(args: argparse.Namespace) -> int:
         if conn is None:
             ss.print_selector_db_error(db_path)
             return 2
-        row = ss.selected_row(conn, args.selector)
-        if row is None:
-            print(f"Not found: {args.selector}", file=sys.stderr)
-            return 2
+        try:
+            row = ss.selected_row(conn, args.selector)
+            if row is None:
+                print(f"Not found: {args.selector}", file=sys.stderr)
+                return 2
 
-        query = ss.query_from_selector(args.selector)
+            query = ss.query_from_selector(args.selector)
 
-        rows = ss.session_rows(conn, row)
-        packet_rows = ss.handoff_rows(rows, row)
-        repo = ss.best_repo(packet_rows, row)
-        if target == row["source"] and ss.native_resume_available(row["source"], row["session_id"]):
-            print("That is the native owner. Open the exact session instead:")
-            for line in ss.native_resume_lines(
-                row["source"],
-                row["session_id"],
-                repo,
-                path=str(row["path"] or ""),
-            ):
+            rows = ss.session_rows(conn, row)
+            packet_rows = ss.handoff_rows(rows, row)
+            repo = ss.best_repo(packet_rows, row)
+            if target == row["source"] and ss.native_resume_available(row["source"], row["session_id"]):
+                print("That is the native owner. Open the exact session instead:")
+                for line in ss.native_resume_lines(
+                    row["source"],
+                    row["session_id"],
+                    repo,
+                    path=str(row["path"] or ""),
+                ):
+                    print(f"  {line}")
+                return 0
+
+            packet_path = ss.handoff_path(row, target)
+            packet_path.parent.mkdir(parents=True, exist_ok=True)
+            card = ss.session_card_for_result(conn, row, query)
+            packet_path.write_text(
+                ss.handoff_packet_text(
+                    row,
+                    target,
+                    query,
+                    args.selector,
+                    packet_rows,
+                    card,
+                    archived=ss.session_is_archived(conn, str(row["source"]), str(row["session_id"])),
+                ),
+                encoding="utf-8",
+            )
+
+            print(f"Context packet: {packet_path}")
+            print(f"Original owner: {ss.source_label(row['source'])}")
+            print(f"Original session: {ss.session_ref(row['source'], row['session_id'])}")
+            print(f"Target harness: {ss.target_label(target)}")
+            print(f"Repo: {ss.repo_label(repo)}")
+            print()
+            print(f"Continue in {ss.target_label(target)}:")
+            for line in ss.launch_lines_for_handoff(target, repo, packet_path):
                 print(f"  {line}")
-            return 0
-
-        packet_path = ss.handoff_path(row, target)
-        packet_path.parent.mkdir(parents=True, exist_ok=True)
-        card = ss.session_card_for_result(conn, row, query)
-        packet_path.write_text(
-            ss.handoff_packet_text(
-                row,
-                target,
-                query,
-                args.selector,
-                packet_rows,
-                card,
-                archived=ss.session_is_archived(conn, str(row["source"]), str(row["session_id"])),
-            ),
-            encoding="utf-8",
-        )
-
-        print(f"Context packet: {packet_path}")
-        print(f"Original owner: {ss.source_label(row['source'])}")
-        print(f"Original session: {ss.session_ref(row['source'], row['session_id'])}")
-        print(f"Target harness: {ss.target_label(target)}")
-        print(f"Repo: {ss.repo_label(repo)}")
-        print()
-        print(f"Continue in {ss.target_label(target)}:")
-        for line in ss.launch_lines_for_handoff(target, repo, packet_path):
-            print(f"  {line}")
+        finally:
+            conn.close()
     return 0
 
 
@@ -343,59 +352,62 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"Index not found: {db_path}")
             return 0
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
-        total = conn.execute("SELECT count(*) FROM documents").fetchone()[0]
-        print(f"db: {db_path}")
-        print(f"documents: {total}")
-        for row in conn.execute(
-            """
-            SELECT source, count(*) AS n, max(ts) AS newest
-            FROM documents
-            GROUP BY source
-                ORDER BY source
+        try:
+            ss.init_db(conn)
+            total = conn.execute("SELECT count(*) FROM documents").fetchone()[0]
+            print(f"db: {db_path}")
+            print(f"documents: {total}")
+            for row in conn.execute(
                 """
-        ):
-            print(f"{row['source']}: {row['n']} newest={ss.iso_date(row['newest'])}")
-        if ss.embedding_backend() is None:
-            print("semantic: unavailable (local model is not installed or cached)")
-        else:
-            embedded_sessions = conn.execute(
+                SELECT source, count(*) AS n, max(ts) AS newest
+                FROM documents
+                GROUP BY source
+                    ORDER BY source
+                    """
+            ):
+                print(f"{row['source']}: {row['n']} newest={ss.iso_date(row['newest'])}")
+            if ss.embedding_backend() is None:
+                print("semantic: unavailable (local model is not installed or cached)")
+            else:
+                embedded_sessions = conn.execute(
+                    """
+                    SELECT count(*)
+                    FROM session_embeddings e
+                    WHERE e.model = ?
+                      AND EXISTS (
+                        SELECT 1
+                        FROM documents d
+                        WHERE d.source = e.source AND d.session_id = e.session_id
+                      )
+                    """,
+                    (ss.EMBED_MODEL_VERSION,),
+                ).fetchone()[0]
+                total_sessions = conn.execute(
+                    "SELECT count(*) FROM (SELECT 1 FROM documents GROUP BY source, session_id)"
+                ).fetchone()[0]
+                print(f"semantic: {embedded_sessions}/{total_sessions} sessions embedded with {ss.EMBED_MODEL}")
+                embedded_turns = conn.execute(
+                    "SELECT count(*) FROM embeddings WHERE model = ?",
+                    (ss.EMBED_MODEL_VERSION,),
+                ).fetchone()[0]
+                print(f"semantic turns: {embedded_turns}/{total} cached (run `ss embed` to backfill)")
+            card_rows = conn.execute(
                 """
                 SELECT count(*)
-                FROM session_embeddings e
-                WHERE e.model = ?
-                  AND EXISTS (
+                FROM session_cards c
+                WHERE EXISTS (
                     SELECT 1
                     FROM documents d
-                    WHERE d.source = e.source AND d.session_id = e.session_id
-                  )
-                """,
-                (ss.EMBED_MODEL_VERSION,),
+                    WHERE d.source = c.source AND d.session_id = c.session_id
+                )
+                """
             ).fetchone()[0]
             total_sessions = conn.execute(
                 "SELECT count(*) FROM (SELECT 1 FROM documents GROUP BY source, session_id)"
             ).fetchone()[0]
-            print(f"semantic: {embedded_sessions}/{total_sessions} sessions embedded with {ss.EMBED_MODEL}")
-            embedded_turns = conn.execute(
-                "SELECT count(*) FROM embeddings WHERE model = ?",
-                (ss.EMBED_MODEL_VERSION,),
-            ).fetchone()[0]
-            print(f"semantic turns: {embedded_turns}/{total} cached (run `ss embed` to backfill)")
-        card_rows = conn.execute(
-            """
-            SELECT count(*)
-            FROM session_cards c
-            WHERE EXISTS (
-                SELECT 1
-                FROM documents d
-                WHERE d.source = c.source AND d.session_id = c.session_id
-            )
-            """
-        ).fetchone()[0]
-        total_sessions = conn.execute(
-            "SELECT count(*) FROM (SELECT 1 FROM documents GROUP BY source, session_id)"
-        ).fetchone()[0]
-        print(f"cards: {card_rows}/{total_sessions} sessions cached")
+            print(f"cards: {card_rows}/{total_sessions} sessions cached")
+        finally:
+            conn.close()
     return 0
 
 
@@ -546,52 +558,67 @@ def cmd_eval(args: argparse.Namespace) -> int:
             print(f"Index not found: {db_path}", file=sys.stderr)
             return 2
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
-        if args.refresh:
-            ss.reset_db(conn)
-            ss.upsert_documents(conn, ss.build_docs(ss.expand(args.home), ss.normalize_sources("all")))
+        try:
+            ss.init_db(conn)
+            if args.refresh:
+                ss.reset_db(conn)
+                ss.upsert_documents(conn, ss.build_docs(ss.expand(args.home), ss.normalize_sources("all")))
 
-        passed = 0
-        failed = 0
-        print(f"Session search evals: {eval_path}")
-        print()
-        for i, case in enumerate(cases, 1):
-            query = ss.sanitize_text(case["query"])
-            limit = int(case.get("limit", args.limit))
-            source = str(case.get("source", "all"))
-            mode = str(case.get("mode", args.mode))
-            display_query, results = ss.run_search(conn, query, limit, source, mode)
-            accept_rules = list(case.get("accept") or [])
-            reject_rules = list(case.get("reject") or [])
-            expected_within = int(case.get("expected_within", 1))
-            bad_before = int(case.get("bad_before", 1))
-
-            good_rank, good_row = ss.result_rank_for_rules(conn, results[:expected_within], display_query, accept_rules)
-            bad_rank, bad_row = ss.result_rank_for_rules(conn, results[:bad_before], display_query, reject_rules)
-
-            ok = (not accept_rules or good_rank is not None) and bad_rank is None
-            status = "PASS" if ok else "FAIL"
-            if ok:
-                passed += 1
-            else:
-                failed += 1
-
-            top = results[0][0] if results else None
-            print(f"{status} {i}. {query}")
-            print(f"   top: {ss.eval_title(conn, top, display_query)}")
-            if accept_rules:
-                found = f"rank {good_rank}: {ss.eval_title(conn, good_row, display_query)}" if good_rank else "not found"
-                print(f"   expected by rank {expected_within}: {found}")
-            if reject_rules:
-                found = f"rank {bad_rank}: {ss.eval_title(conn, bad_row, display_query)}" if bad_rank else "none"
-                print(f"   rejected before rank {bad_before}: {found}")
-            if getattr(args, "verbose", False):
-                for rank, (row, _score, label) in enumerate(results[: min(limit, 5)], 1):
-                    print(f"   {rank}. [{row['source']}] {ss.eval_title(conn, row, display_query)} ({label})")
+            passed = 0
+            failed = 0
+            print(f"Session search evals: {eval_path}")
             print()
+            for i, case in enumerate(cases, 1):
+                query = ss.sanitize_text(case["query"])
+                limit = int(case.get("limit", args.limit))
+                source = str(case.get("source", "all"))
+                mode = str(case.get("mode", args.mode))
+                display_query, results = ss.run_search(conn, query, limit, source, mode)
+                accept_rules = list(case.get("accept") or [])
+                reject_rules = list(case.get("reject") or [])
+                expected_within = int(case.get("expected_within", 1))
+                bad_before = int(case.get("bad_before", 1))
 
-        print(f"Summary: {passed} passed, {failed} failed")
-        return 0 if failed == 0 else 1
+                good_rank, good_row = ss.result_rank_for_rules(
+                    conn, results[:expected_within], display_query, accept_rules
+                )
+                bad_rank, bad_row = ss.result_rank_for_rules(
+                    conn, results[:bad_before], display_query, reject_rules
+                )
+
+                ok = (not accept_rules or good_rank is not None) and bad_rank is None
+                status = "PASS" if ok else "FAIL"
+                if ok:
+                    passed += 1
+                else:
+                    failed += 1
+
+                top = results[0][0] if results else None
+                print(f"{status} {i}. {query}")
+                print(f"   top: {ss.eval_title(conn, top, display_query)}")
+                if accept_rules:
+                    found = (
+                        f"rank {good_rank}: {ss.eval_title(conn, good_row, display_query)}"
+                        if good_rank
+                        else "not found"
+                    )
+                    print(f"   expected by rank {expected_within}: {found}")
+                if reject_rules:
+                    found = (
+                        f"rank {bad_rank}: {ss.eval_title(conn, bad_row, display_query)}"
+                        if bad_rank
+                        else "none"
+                    )
+                    print(f"   rejected before rank {bad_before}: {found}")
+                if getattr(args, "verbose", False):
+                    for rank, (row, _score, label) in enumerate(results[: min(limit, 5)], 1):
+                        print(f"   {rank}. [{row['source']}] {ss.eval_title(conn, row, display_query)} ({label})")
+                print()
+
+            print(f"Summary: {passed} passed, {failed} failed")
+            return 0 if failed == 0 else 1
+        finally:
+            conn.close()
 
 
 def cmd_natural(args: argparse.Namespace) -> int:

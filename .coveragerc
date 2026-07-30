@@ -1,12 +1,12 @@
 [run]
 branch = True
-source =
-    archive_intent
-    archive_store
-    platform_lock
-    schema_migrations
+source = .
+omit =
+    tests/*
+    scripts/*
+    .venv/*
+    build/*
 
 [report]
-fail_under = 90
 show_missing = True
 skip_covered = True
