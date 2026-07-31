@@ -286,10 +286,11 @@ class DashboardWorkMapContracts(unittest.TestCase):
             ts=200,
         )
 
-        name, results = ss.dashboard_project_results(self.conn, "personal / career")
+        name, results, total = ss.dashboard_project_results(self.conn, "personal / career")
 
         self.assertEqual(name, "Personal / Career")
         self.assertEqual(len(results), 3)
+        self.assertEqual(total, 3)
         self.assertEqual(
             {str(row["session_id"]) for row, _score, _label in results},
             {"career-0", "career-1", "career-2"},
@@ -354,12 +355,380 @@ class DashboardWorkMapContracts(unittest.TestCase):
         )
         with (
             mock.patch.object(ss, "dashboard_is_interactive", return_value=True),
-            mock.patch("builtins.input", return_value="p2"),
+            mock.patch("builtins.input", side_effect=["p2", "q"]),
             mock.patch.object(ss, "cmd_project", return_value=0) as project,
         ):
             self.assertEqual(ss.dashboard_prompt(args), 0)
         self.assertEqual(project.call_args.args[0].project, "Shared / Osmo")
         self.assertEqual(project.call_args.args[0].project_choices, project_choices)
+
+    def test_project_aggregation_counts_beyond_old_scan_and_page_caps(self) -> None:
+        for index in range(300):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"scaled-{index}",
+                cwd="/Users/alex/workspace/os/personal/career",
+                title=f"Scaled {index}",
+                about=f"Scaled work {index}",
+                state="Stored evidence",
+                resume="Continue",
+                ts=10_000 + index,
+            )
+        with mock.patch.object(
+            ss,
+            "session_card_for_result",
+            side_effect=AssertionError("aggregation constructed cards"),
+        ):
+            projects = ss.dashboard_project_summaries(
+                self.conn,
+                source_name="all",
+                thread_limit=10,
+                project_scan_limit=1,
+            )
+            name, first_page, total = ss.dashboard_project_results(
+                self.conn,
+                "Personal / Career",
+                limit=500,
+            )
+            _name, second_page, second_total = ss.dashboard_project_results(
+                self.conn,
+                "Personal / Career",
+                limit=200,
+                offset=200,
+            )
+
+        career = next(item for item in projects if item["project"] == "Personal / Career")
+        self.assertEqual(career["count"], 300)
+        self.assertEqual(name, "Personal / Career")
+        self.assertEqual(total, 300)
+        self.assertEqual(second_total, 300)
+        self.assertEqual(len(first_page), 200)
+        self.assertEqual(len(second_page), 100)
+        self.assertTrue(
+            {str(row["session_id"]) for row, _score, _label in first_page}.isdisjoint(
+                {str(row["session_id"]) for row, _score, _label in second_page}
+            )
+        )
+
+    def test_recent_active_sessions_survive_a_large_archived_prefix(self) -> None:
+        for index in range(10):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"active-{index}",
+                cwd="/Users/alex/workspace/os/personal/active",
+                title=f"Active {index}",
+                about="Active work",
+                state="Indexed",
+                resume="Continue",
+                ts=100 + index,
+            )
+        for index in range(60):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"archived-{index}",
+                cwd="/Users/alex/workspace/os/personal/archive",
+                title=f"Archived {index}",
+                about="Archived work",
+                state="Finished",
+                resume="None",
+                ts=1000 + index,
+                archived=True,
+            )
+
+        results = ss.recent_session_results(self.conn, 10, "all")
+
+        self.assertEqual(len(results), 10)
+        self.assertTrue(
+            all(str(row["session_id"]).startswith("active-") for row, _score, _label in results)
+        )
+
+    def test_all_project_sources_include_vscode_and_cursor(self) -> None:
+        for source in ss.SUPPORTED_SOURCES:
+            _seed_session(
+                self.conn,
+                source=source,
+                session_id=f"{source}-project",
+                cwd="/Users/alex/workspace/os/research/all-tools",
+                title=f"{source} project",
+                about=f"{source} work",
+                state="Indexed",
+                resume="Continue",
+                ts=100,
+            )
+
+        name, results, total = ss.dashboard_project_results(
+            self.conn,
+            "Research / All Tools",
+            source_name="all",
+        )
+
+        self.assertEqual(name, "Research / All Tools")
+        self.assertEqual(total, 5)
+        self.assertEqual(
+            {str(row["source"]) for row, _score, _label in results},
+            set(ss.SUPPORTED_SOURCES),
+        )
+        projects = ss.dashboard_project_summaries(self.conn, source_name="all")
+        project = next(item for item in projects if item["project"] == "Research / All Tools")
+        self.assertEqual(project["count"], 5)
+
+    def test_project_aggregation_includes_real_non_user_adapter_roles(self) -> None:
+        roles = {
+            "codex": "session",
+            "claude": "assistant",
+            "pi": "user",
+            "vscode": "state",
+            "cursor": "turn",
+        }
+        ss.upsert_documents(
+            self.conn,
+            [
+                ss.Document(
+                    doc_id=f"{source}:role-shaped",
+                    source=source,
+                    session_id=f"{source}-role-shaped",
+                    title=f"{source} role-shaped session",
+                    path=f"/tmp/{source}/state",
+                    cwd="/Users/alex/workspace/os/research/role-shaped",
+                    role=role,
+                    ts=100,
+                    text=f"Indexed {source} through its real adapter role.",
+                    meta={},
+                )
+                for source, role in roles.items()
+            ],
+        )
+
+        name, results, total = ss.dashboard_project_results(
+            self.conn,
+            "Research / Role Shaped",
+            source_name="all",
+        )
+
+        self.assertEqual(name, "Research / Role Shaped")
+        self.assertEqual(total, 5)
+        self.assertEqual(
+            {str(row["source"]) for row, _score, _label in results},
+            set(roles),
+        )
+        recent = ss.recent_session_results(self.conn, 10, "all")
+        self.assertEqual(
+            {str(row["source"]) for row, _score, _label in recent},
+            set(roles),
+        )
+
+    def test_project_grouping_ignores_stale_cached_repo(self) -> None:
+        _seed_session(
+            self.conn,
+            source="codex",
+            session_id="moved-project",
+            cwd="/Users/alex/workspace/os/labs/alpha",
+            title="Moved project",
+            about="Initial location",
+            state="Indexed",
+            resume="Continue",
+            ts=100,
+        )
+        row = self.conn.execute(
+            "SELECT * FROM documents WHERE doc_id = ?",
+            ("codex:moved-project:user",),
+        ).fetchone()
+        card = ss.session_card_for_result(self.conn, row, "", persist=False)
+        ss.store_session_card(
+            self.conn,
+            card,
+            ss.session_card_hash(ss.session_rows(self.conn, row)),
+        )
+        ss.upsert_documents(
+            self.conn,
+            [
+                ss.Document(
+                    doc_id="codex:moved-project:new",
+                    source="codex",
+                    session_id="moved-project",
+                    title="Moved project",
+                    path="/tmp/codex/moved-project.jsonl",
+                    cwd="/Users/alex/workspace/os/labs/beta",
+                    role="user",
+                    ts=200,
+                    text="The session moved to the beta project.",
+                    meta={},
+                )
+            ],
+        )
+
+        projects = ss.dashboard_project_summaries(self.conn)
+        counts = {item["project"]: item["count"] for item in projects}
+        self.assertEqual(counts.get("Labs / Beta"), 1)
+        self.assertNotIn("Labs / Alpha", counts)
+
+    def test_project_command_honors_limit_and_discloses_total(self) -> None:
+        for index in range(3):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"limited-{index}",
+                cwd="/Users/alex/workspace/os/personal",
+                title=f"Limited {index}",
+                about="Bounded page",
+                state="Indexed",
+                resume="Continue",
+                ts=100 + index,
+            )
+        args = argparse.Namespace(
+            db=str(self.db),
+            home=str(self.home),
+            project="Personal",
+            limit=1,
+            page=1,
+            source="all",
+            mode="hybrid",
+            no_refresh=True,
+            prompt=False,
+        )
+        out = io.StringIO()
+        with (
+            mock.patch.object(ss, "save_last_results") as save,
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(ss.cmd_project(args), 0)
+
+        saved_results = save.call_args.args[0]
+        self.assertEqual(len(saved_results), 1)
+        self.assertIn("1-1 shown of 3 threads", out.getvalue())
+        self.assertNotIn("Open: ss open 2", out.getvalue())
+
+    def test_project_switching_uses_one_real_prompt_loop(self) -> None:
+        for index, cwd in enumerate(
+            (
+                "/Users/alex/workspace/os/personal",
+                "/Users/alex/workspace/os/_shared/osmo",
+                "/Users/alex/workspace/os/research",
+            ),
+            1,
+        ):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"switch-{index}",
+                cwd=cwd,
+                title=f"Switch {index}",
+                about=f"Project {index}",
+                state="Indexed",
+                resume="Continue",
+                ts=100 + index,
+            )
+        choices = [
+            {"project": "Personal"},
+            {"project": "Shared / Osmo"},
+            {"project": "Research"},
+        ]
+        args = argparse.Namespace(
+            db=str(self.db),
+            home=str(self.home),
+            limit=10,
+            source="all",
+            mode="hybrid",
+            no_refresh=True,
+            project_choices=choices,
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(ss, "dashboard_is_interactive", return_value=True),
+            mock.patch("builtins.input", side_effect=["p1", "p2", "p3", "q"]),
+            mock.patch.object(ss, "save_last_results"),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(ss.dashboard_prompt(args), 0)
+
+        rendered = output.getvalue()
+        self.assertIn("SS project · Personal", rendered)
+        self.assertIn("SS project · Shared / Osmo", rendered)
+        self.assertIn("SS project · Research", rendered)
+
+    def test_project_next_page_replaces_the_saved_selector_page(self) -> None:
+        for index in range(3):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"page-{index}",
+                cwd="/Users/alex/workspace/os/personal",
+                title=f"Page {index}",
+                about="Paged project",
+                state="Indexed",
+                resume="Continue",
+                ts=100 + index,
+            )
+        args = argparse.Namespace(
+            db=str(self.db),
+            home=str(self.home),
+            limit=10,
+            source="all",
+            mode="hybrid",
+            no_refresh=True,
+            project_choices=[],
+            current_project="Personal",
+            project_page=1,
+            project_total=3,
+            project_limit=1,
+        )
+        saved_pages: list[list[str]] = []
+
+        def capture(results, _query, _db) -> None:
+            saved_pages.append(
+                [str(row["session_id"]) for row, _score, _label in results]
+            )
+
+        with (
+            mock.patch.object(ss, "dashboard_is_interactive", return_value=True),
+            mock.patch("builtins.input", side_effect=["n", "q"]),
+            mock.patch.object(ss, "save_last_results", side_effect=capture),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(ss.dashboard_prompt(args), 0)
+
+        self.assertEqual(saved_pages, [["page-1"]])
+        self.assertEqual(args.project_page, 2)
+
+    def test_back_from_first_project_page_returns_to_dashboard(self) -> None:
+        _seed_session(
+            self.conn,
+            source="codex",
+            session_id="back-project",
+            cwd="/Users/alex/workspace/os/personal",
+            title="Back project",
+            about="Return to dashboard",
+            state="Indexed",
+            resume="Continue",
+            ts=100,
+        )
+        args = argparse.Namespace(
+            db=str(self.db),
+            home=str(self.home),
+            limit=10,
+            source="all",
+            mode="hybrid",
+            no_refresh=True,
+            project_choices=[],
+            current_project="Personal",
+            project_page=1,
+            project_total=1,
+            project_limit=200,
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(ss, "dashboard_is_interactive", return_value=True),
+            mock.patch("builtins.input", side_effect=["b", "q"]),
+            mock.patch.object(ss, "save_last_results"),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(ss.dashboard_prompt(args), 0)
+
+        self.assertEqual(args.current_project, "")
+        self.assertIn("\nSS\n", output.getvalue())
 
     def test_project_command_keeps_parent_selectors_for_another_choice(self) -> None:
         _seed_session(

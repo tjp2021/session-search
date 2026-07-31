@@ -27,34 +27,41 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             print(f"Index not found: {db_path}", file=sys.stderr)
             return 2
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
-        if not getattr(args, "no_refresh", False):
-            ss.refresh_dashboard_index(conn, ss.expand(args.home))
-        archived_view = bool(getattr(args, "archived", False))
-        missing_archived = 0
-        if archived_view:
-            results, missing_archived = ss.archived_session_results(conn, args.limit, args.source)
-            project_summaries = None
-        else:
-            # Exact limit for the thread list and open numbers.
-            results = ss.recent_session_results(conn, args.limit, args.source)
-            # Wider project scan so older folders still appear after a restart.
-            project_summaries = ss.dashboard_project_summaries(
+        try:
+            ss.init_db(conn)
+            if not getattr(args, "no_refresh", False):
+                ss.refresh_dashboard_index(conn, ss.expand(args.home))
+            archived_view = bool(getattr(args, "archived", False))
+            missing_archived = 0
+            if archived_view:
+                results, missing_archived = ss.archived_session_results(
+                    conn, args.limit, args.source
+                )
+                project_summaries = None
+            else:
+                results = ss.recent_session_results(conn, args.limit, args.source)
+                project_summaries = ss.dashboard_project_summaries(
+                    conn,
+                    source_name=getattr(args, "source", "all") or "all",
+                    thread_limit=args.limit,
+                )
+            ss.save_last_results(results, "recent sessions dashboard", db_path)
+            project_choices = ss.print_dashboard(
                 conn,
-                source_name=getattr(args, "source", "all") or "all",
-                thread_limit=args.limit,
+                results,
+                archived_view=archived_view,
+                project_summaries=project_summaries,
             )
-        ss.save_last_results(results, "recent sessions dashboard", db_path)
-        project_choices = ss.print_dashboard(
-            conn,
-            results,
-            archived_view=archived_view,
-            project_summaries=project_summaries,
-        )
-        args.project_choices = project_choices
-        if missing_archived:
-            print(f"{missing_archived} archived session(s) are missing from the index. Run: ss fresh archived")
-        conn.close()
+            args.project_choices = project_choices
+            if missing_archived:
+                print(
+                    f"{missing_archived} archived session(s) are missing from "
+                    "the index. Run: ss fresh archived"
+                )
+        finally:
+            conn.close()
+    if not bool(getattr(args, "prompt", True)):
+        return 0
     return ss.dashboard_prompt(args)
 
 
@@ -68,32 +75,48 @@ def cmd_project(args: argparse.Namespace) -> int:
             print(f"Index not found: {db_path}", file=sys.stderr)
             return 2
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
-        canonical_name, results = ss.dashboard_project_results(
-            conn,
-            project_name,
-            limit=max(200, int(getattr(args, "limit", 200))),
-            source_name=getattr(args, "source", "all") or "all",
-        )
-        if not results:
-            print(f"Project not found: {project_name}", file=sys.stderr)
+        try:
+            ss.init_db(conn)
+            requested_limit = min(
+                ss.PROJECT_PAGE_MAX,
+                max(1, int(getattr(args, "limit", ss.PROJECT_PAGE_MAX))),
+            )
+            page = max(1, int(getattr(args, "page", 1)))
+            offset = (page - 1) * requested_limit
+            canonical_name, results, total = ss.dashboard_project_results(
+                conn,
+                project_name,
+                limit=requested_limit,
+                source_name=getattr(args, "source", "all") or "all",
+                offset=offset,
+            )
+            if not results:
+                print(f"Project not found: {project_name}", file=sys.stderr)
+                return 2
+            ss.save_last_results(results, f"project: {canonical_name}", db_path)
+            ss.print_dashboard(
+                conn,
+                results,
+                project_summaries=[],
+                heading=f"SS project · {canonical_name}",
+                total_threads=total,
+                page_offset=offset,
+            )
+        finally:
             conn.close()
-            return 2
-        ss.save_last_results(results, f"project: {canonical_name}", db_path)
-        ss.print_dashboard(
-            conn,
-            results,
-            project_summaries=[],
-            heading=f"SS project · {canonical_name}",
-        )
-        conn.close()
-    # Keep the parent dashboard map so P2 still works after P1 opens.
+    # Keep stable selector and page state in one caller-owned prompt loop.
     args.project_choices = project_choices
+    args.current_project = canonical_name
+    args.project_page = page
+    args.project_total = total
+    args.project_limit = requested_limit
     args.home = getattr(args, "home", "~")
     args.no_refresh = True
-    args.limit = max(200, int(getattr(args, "limit", 200)))
+    args.limit = requested_limit
     args.source = getattr(args, "source", "all") or "all"
     args.mode = getattr(args, "mode", "hybrid")
+    if not bool(getattr(args, "prompt", True)):
+        return 0
     return ss.dashboard_prompt(args)
 
 
@@ -111,21 +134,26 @@ def cmd_archive_audit(args: argparse.Namespace) -> int:
             print(f"Index not found: {db_path}", file=sys.stderr)
             return 2
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
-        quick_check(conn)
-        proposals, unresolved = ss.archive_migration_audit(conn)
-        print(f"Archive parser migration audit: v{ARCHIVE_INTENT_VERSION}")
-        print(f"Proposed state repairs: {len(proposals)}")
-        print(f"Unresolved evidence: {len(unresolved)}")
-        for proposal in proposals:
-            state = "ARCHIVED" if proposal["archived"] else "ACTIVE"
-            print(f"  {proposal['source']}:{proposal['session_id']} -> {state} ({proposal['reason']})")
-        for item in unresolved:
-            print(
-                f"  REVIEW {item['source']}:{item['session_id']} "
-                f"missing {item['evidence_doc_id'] or 'evidence document id'}"
-            )
-        conn.close()
+        try:
+            ss.init_db(conn)
+            quick_check(conn)
+            proposals, unresolved = ss.archive_migration_audit(conn)
+            print(f"Archive parser migration audit: v{ARCHIVE_INTENT_VERSION}")
+            print(f"Proposed state repairs: {len(proposals)}")
+            print(f"Unresolved evidence: {len(unresolved)}")
+            for proposal in proposals:
+                state = "ARCHIVED" if proposal["archived"] else "ACTIVE"
+                print(
+                    f"  {proposal['source']}:{proposal['session_id']} -> "
+                    f"{state} ({proposal['reason']})"
+                )
+            for item in unresolved:
+                print(
+                    f"  REVIEW {item['source']}:{item['session_id']} "
+                    f"missing {item['evidence_doc_id'] or 'evidence document id'}"
+                )
+        finally:
+            conn.close()
     return 0
 
 
@@ -135,29 +163,37 @@ def cmd_set_archive(args: argparse.Namespace) -> int:
         if conn is None:
             ss.print_selector_db_error(db_path)
             return 2
-        row = ss.selected_row(conn, args.selector)
-        if row is None:
-            print(f"Not found: {args.selector}", file=sys.stderr)
-            return 2
-        archived = bool(args.archived)
         try:
-            with immediate_transaction(conn):
-                ss.set_session_archive_status(
-                    conn,
-                    str(row["source"]),
-                    str(row["session_id"]),
-                    archived,
-                    "manual",
-                    evidence=f"manual {'archive' if archived else 'unarchive'} via selector {args.selector}",
-                )
-        except Exception:
-            conn.rollback()
+            row = ss.selected_row(conn, args.selector)
+            if row is None:
+                print(f"Not found: {args.selector}", file=sys.stderr)
+                return 2
+            archived = bool(args.archived)
+            try:
+                with immediate_transaction(conn):
+                    ss.set_session_archive_status(
+                        conn,
+                        str(row["source"]),
+                        str(row["session_id"]),
+                        archived,
+                        "manual",
+                        evidence=(
+                            f"manual {'archive' if archived else 'unarchive'} "
+                            f"via selector {args.selector}"
+                        ),
+                    )
+            except Exception:
+                conn.rollback()
+                raise
+            card = ss.session_card_for_result(
+                conn, row, ss.query_from_selector(args.selector)
+            )
+            print(f"{'Archived' if archived else 'Unarchived'}: {card.title}")
+            print(
+                f"Session: {ss.session_ref(str(row['source']), str(row['session_id']))}"
+            )
+        finally:
             conn.close()
-            raise
-        card = ss.session_card_for_result(conn, row, ss.query_from_selector(args.selector))
-        print(f"{'Archived' if archived else 'Unarchived'}: {card.title}")
-        print(f"Session: {ss.session_ref(str(row['source']), str(row['session_id']))}")
-        conn.close()
     return 0
 
 
@@ -251,27 +287,30 @@ def cmd_show(args: argparse.Namespace) -> int:
         if conn is None:
             ss.print_selector_db_error(db_path)
             return 2
-        row = ss.selected_row(conn, args.doc_id)
-        if row is None:
-            print(f"Not found: {args.doc_id}", file=sys.stderr)
-            return 2
-        query = ss.query_from_selector(args.doc_id)
-        card = ss.session_card_for_result(conn, row, query)
-        ss.print_session_card_detail(
-            card,
-            ss.session_is_archived(conn, str(row["source"]), str(row["session_id"])),
-        )
-        if query:
-            print(f"Search query: {query}")
+        try:
+            row = ss.selected_row(conn, args.doc_id)
+            if row is None:
+                print(f"Not found: {args.doc_id}", file=sys.stderr)
+                return 2
+            query = ss.query_from_selector(args.doc_id)
+            card = ss.session_card_for_result(conn, row, query)
+            ss.print_session_card_detail(
+                card,
+                ss.session_is_archived(conn, str(row["source"]), str(row["session_id"])),
+            )
+            if query:
+                print(f"Search query: {query}")
+                print()
+            print(f"[{row['source']}] {ss.iso_date(row['ts'])} {row['title']}")
+            print(f"id: {row['doc_id']}")
+            print(f"path: {row['path']}")
+            if row["cwd"]:
+                print(f"cwd: {row['cwd']}")
+            print(f"role: {row['role']}")
             print()
-        print(f"[{row['source']}] {ss.iso_date(row['ts'])} {row['title']}")
-        print(f"id: {row['doc_id']}")
-        print(f"path: {row['path']}")
-        if row["cwd"]:
-            print(f"cwd: {row['cwd']}")
-        print(f"role: {row['role']}")
-        print()
-        print(row["text"])
+            print(row["text"])
+        finally:
+            conn.close()
     return 0
 
 
@@ -281,14 +320,20 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if conn is None:
             ss.print_selector_db_error(db_path)
             return 2
-        row = ss.selected_row(conn, args.selector)
-        if row is None:
+        try:
+            row = ss.selected_row(conn, args.selector)
+            if row is None:
+                print(f"Not found: {args.selector}", file=sys.stderr)
+                return 2
+            ss.mark_cli_resume(conn, row, args.selector, "cli-open")
+            ss.print_resume_instructions(
+                conn,
+                row,
+                args.selector,
+                ss.query_from_selector(args.selector),
+            )
+        finally:
             conn.close()
-            print(f"Not found: {args.selector}", file=sys.stderr)
-            return 2
-        ss.mark_cli_resume(conn, row, args.selector, "cli-open")
-        ss.print_resume_instructions(conn, row, args.selector, ss.query_from_selector(args.selector))
-        conn.close()
     return 0
 
 
@@ -306,19 +351,33 @@ def cmd_continue(args: argparse.Namespace) -> int:
         if conn is None:
             ss.print_selector_db_error(db_path)
             return 2
-        row = ss.selected_row(conn, args.selector)
-        if row is None:
+        handoff_required = False
+        try:
+            row = ss.selected_row(conn, args.selector)
+            if row is None:
+                print(f"Not found: {args.selector}", file=sys.stderr)
+                return 2
+            ss.mark_cli_resume(conn, row, args.selector, "cli-continue")
+            if not target or (
+                target == row["source"]
+                and ss.native_resume_available(row["source"], row["session_id"])
+            ):
+                ss.print_resume_instructions(
+                    conn,
+                    row,
+                    args.selector,
+                    ss.query_from_selector(args.selector),
+                )
+                return 0
+            handoff_required = True
+        finally:
             conn.close()
-            print(f"Not found: {args.selector}", file=sys.stderr)
-            return 2
-        ss.mark_cli_resume(conn, row, args.selector, "cli-continue")
-        if not target or (target == row["source"] and ss.native_resume_available(row["source"], row["session_id"])):
-            ss.print_resume_instructions(conn, row, args.selector, ss.query_from_selector(args.selector))
-            conn.close()
-            return 0
-        conn.close()
 
-    return ss.cmd_handoff(argparse.Namespace(db=args.db, selector=args.selector, target=target))
+    if handoff_required:
+        return ss.cmd_handoff(
+            argparse.Namespace(db=args.db, selector=args.selector, target=target)
+        )
+    return 0
 
 
 def cmd_handoff(args: argparse.Namespace) -> int:
@@ -456,6 +515,38 @@ def cmd_capabilities(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Report adapter drift without exposing private paths or session text."""
+    sources = ss.normalize_sources(getattr(args, "source", "all"))
+    results = ss.adapter_health(ss.expand(getattr(args, "home", "~")), sources)
+    print("Adapter health")
+    drifted = False
+    for result in results:
+        label = ss.source_label(result.source)
+        if result.status == "candidate_store_zero_content":
+            drifted = True
+            detail = (
+                f"ATTENTION: {result.candidate_stores} candidate store(s), "
+                "but no session documents parsed"
+            )
+        elif result.status == "partial_store_drift":
+            drifted = True
+            detail = (
+                f"ATTENTION: {result.parsed_documents} document(s) parsed; "
+                f"{result.zero_content_stores} store(s) produced no content; "
+                f"{result.error_stores} store(s) contained malformed data"
+            )
+        elif result.status == "parsed_documents":
+            detail = (
+                f"ready: {result.parsed_documents} document(s) from "
+                f"{result.candidate_stores} candidate store(s)"
+            )
+        else:
+            detail = "not found: no candidate store"
+        print(f"- {label}: {detail}")
+    return 1 if bool(getattr(args, "strict", False)) and drifted else 0
+
+
 def cmd_demo(_args: argparse.Namespace) -> int:
     from demo_runner import run_demo
 
@@ -470,10 +561,17 @@ def cmd_cards(args: argparse.Namespace) -> int:
         return 2
     with ss.session_lock(shared=False):
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
+        try:
+            ss.init_db(conn)
+        except Exception:
+            conn.close()
+            raise
     # Building is network bound and can run for minutes. Holding the exclusive
     # lock across it made every other ss command fail with a lock timeout.
-    ss.ensure_session_cards(conn, limit=args.limit, quiet=False)
+    try:
+        ss.ensure_session_cards(conn, limit=args.limit, quiet=False)
+    finally:
+        conn.close()
     return 0
 
 
@@ -484,11 +582,14 @@ def cmd_embed(args: argparse.Namespace) -> int:
             print(f"Index not found: {db_path}", file=sys.stderr)
             return 2
         conn = ss.connect_db(db_path)
-        ss.init_db(conn)
-        session_count = ss.ensure_session_embeddings(conn, limit=args.limit, quiet=False)
-        document_count = ss.ensure_embeddings(conn, limit=args.limit, quiet=False)
-        if session_count == 0 and document_count == 0 and ss.embedding_backend() is not None:
-            print("Semantic index is already up to date.")
+        try:
+            ss.init_db(conn)
+            session_count = ss.ensure_session_embeddings(conn, limit=args.limit, quiet=False)
+            document_count = ss.ensure_embeddings(conn, limit=args.limit, quiet=False)
+            if session_count == 0 and document_count == 0 and ss.embedding_backend() is not None:
+                print("Semantic index is already up to date.")
+        finally:
+            conn.close()
     return 0
 
 
@@ -742,6 +843,7 @@ def build_parser() -> argparse.ArgumentParser:
     project = sub.add_parser("project", help="Show every indexed session in one dashboard project.")
     project.add_argument("project", nargs="+")
     project.add_argument("--limit", type=int, default=200)
+    project.add_argument("--page", type=int, default=1)
     project.add_argument("--source", default="all", choices=list(ss.SOURCE_CHOICES))
     project.set_defaults(func=ss.cmd_project, mode="hybrid", home="~", no_refresh=True)
 
@@ -766,6 +868,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     capabilities = sub.add_parser("capabilities", help="Show supported behavior for each session source.")
     capabilities.set_defaults(func=ss.cmd_capabilities)
+
+    doctor = sub.add_parser("doctor", help="Check local session adapters for format drift.")
+    doctor.add_argument("--source", default="all", choices=["all", *ss.SUPPORTED_SOURCES])
+    doctor.add_argument("--strict", action="store_true")
+    doctor.set_defaults(func=ss.cmd_doctor)
 
     demo = sub.add_parser("demo", help="Run an isolated demonstration with synthetic sessions.")
     demo.set_defaults(func=ss.cmd_demo)

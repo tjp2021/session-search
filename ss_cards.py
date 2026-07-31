@@ -148,13 +148,17 @@ def llm_summarize(prompt: str, max_tokens: int = 220) -> str:
     """Call OpenRouter chat completions (gpt-4.1-nano) to summarize the given text.
 
     Returns an empty string on any failure so callers fall back to regex heuristics.
+    Credential-shaped text is redacted here, at the final network boundary, so
+    every caller receives the same protection while local text stays unchanged.
     """
     if not ss.llm_available():
         return ""
-    import requests
 
     api_key = ss._load_openrouter_api_key()
+    outbound_prompt, _redacted = redact_secrets(prompt)
     try:
+        import requests
+
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
@@ -163,7 +167,7 @@ def llm_summarize(prompt: str, max_tokens: int = 220) -> str:
             },
             json={
                 "model": "openai/gpt-4.1-nano",
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": outbound_prompt}],
                 "max_tokens": max_tokens,
                 "temperature": 0.2,
             },
@@ -866,9 +870,6 @@ def build_session_card(rows: list[sqlite3.Row], best_row: sqlite3.Row, query: st
     session_text = "\n".join(
         str(ss.row_field(r, "text", "")) for r in ordered if str(ss.row_field(r, "text", "")).strip()
     )[:4000]
-    # This is the only place an outbound payload is assembled, so redaction
-    # happens here rather than at each prompt. Local storage keeps the original.
-    session_text, _redacted = redact_secrets(session_text)
     if use_llm and session_text.strip():
         about = ss.llm_summarize(f"{ss.ABOUT_INSTRUCTION}{session_text}", max_tokens=140)
         about = ss.strip_prompt_echo(about, ss.ABOUT_INSTRUCTION)

@@ -19,17 +19,18 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[semantic,dev]"
       - run: coverage run --branch -m unittest discover -s tests -q
-      # All first-party modules hold the clean-run 73% baseline. The four
+      # All first-party modules hold the clean-run 77% baseline. The four
       # hardened helpers hold 90. The facade family and its largest gaps have
       # separate floors, so one module cannot hide another module's loss.
-      - run: coverage report --fail-under=73
+      - run: coverage report --fail-under=77
       - run: coverage report --include="archive_intent.py,archive_store.py,platform_lock.py,schema_migrations.py" --fail-under=90
-      - run: coverage report --include="session_search.py,ss_*.py" --fail-under=71
-      - run: coverage report --include="ss_adapters.py" --fail-under=59
+      - run: coverage report --include="session_search.py,ss_*.py" --fail-under=75
+      - run: coverage report --include="ss_adapters.py" --fail-under=74
       - run: coverage report --include="ss_retrieval.py" --fail-under=55
-      - run: coverage report --include="ss_cli.py" --fail-under=71
+      - run: coverage report --include="ss_cli.py" --fail-under=74
       - run: python tests/run_public_card_quality_eval.py
-      - run: python tests/run_public_retrieval_eval.py --mode hybrid
+      - run: python tests/run_public_retrieval_eval.py --mode all --expected evidence/public-retrieval-v0.1.0.json
+      - run: python tests/run_dashboard_latency_gate.py
       - run: python scripts/check_public_privacy.py
       - run: ss demo
 
@@ -47,4 +48,6 @@ jobs:
       - run: /tmp/session-search-install/bin/ss capabilities
       - run: /tmp/session-search-install/bin/ss demo
       - run: /tmp/session-search-install/bin/python ${{ github.workspace }}/tests/test_adapter_pipeline.py -q
+        working-directory: /tmp
+      - run: /tmp/session-search-install/bin/python ${{ github.workspace }}/tests/run_installed_acceptance.py --ss /tmp/session-search-install/bin/ss
         working-directory: /tmp

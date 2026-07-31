@@ -24,8 +24,12 @@ PATTERNS: tuple[tuple[int, str, re.Pattern[str], str], ...] = (
         "api-key",
         re.compile(
             r"\b(?:sk_live_[a-zA-Z0-9]{20,}|sk_test_[a-zA-Z0-9]{20,}"
-            r"|pk_live_[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|gho_[a-zA-Z0-9]{36,}"
+            r"|rk_live_[a-zA-Z0-9]{20,}|rk_test_[a-zA-Z0-9]{20,}"
+            r"|pk_live_[a-zA-Z0-9]{20,}|sk-[a-zA-Z0-9]{40,}"
+            r"|gh[pousr]_[a-zA-Z0-9_]{36,}"
             r"|glpat-[a-zA-Z0-9]{20,}|xoxb-[a-zA-Z0-9-]{20,}|xoxp-[a-zA-Z0-9-]{20,}"
+            r"|github_pat_[a-zA-Z0-9_]{20,}|xapp-[a-zA-Z0-9-]{20,}"
+            r"|AIza[a-zA-Z0-9_-]{35}|hf_[a-zA-Z0-9]{20,}"
             r"|sk-ant-[a-zA-Z0-9-]{20,}|sk-proj-[a-zA-Z0-9-]{20,}"
             r"|sk-or-v1-[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16})"
         ),
@@ -48,6 +52,15 @@ PATTERNS: tuple[tuple[int, str, re.Pattern[str], str], ...] = (
         "notion-key",
         re.compile(r"\b(?:secret_[a-zA-Z0-9]{32,}|ntn_[a-zA-Z0-9]{20,})"),
         "[redacted notion key]",
+    ),
+    (
+        0,
+        "quoted-password",
+        re.compile(
+            r"\b((?:password|passwd|pwd)\s*[:=]\s*)([\"'])([^\"'\r\n]{8,})([\"'])",
+            re.I,
+        ),
+        r"\1\2[redacted password]\4",
     ),
     (
         5,
@@ -76,8 +89,19 @@ PATTERNS: tuple[tuple[int, str, re.Pattern[str], str], ...] = (
     (
         0,
         "url-credentials",
-        re.compile(r"\b([a-z][a-z0-9+.\-]*://[^\s:@/]+:)[^\s:@/]+(@)"),
+        re.compile(r"\b([a-z][a-z0-9+.\-]*://[^\s:@/]+:)[^\s@/]+(@)"),
         r"\1[redacted password]\2",
+    ),
+    (
+        0,
+        "assigned-secret",
+        re.compile(
+            r"\b((?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|"
+            r"client[_-]?secret|aws_secret_access_key)"
+            r"[\"' ]*[:=][\"' ]*)[a-zA-Z0-9_./+=-]{16,}",
+            re.I,
+        ),
+        r"\1[redacted secret]",
     ),
 )
 

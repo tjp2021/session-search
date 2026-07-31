@@ -12,9 +12,148 @@ import glob
 import json
 import pathlib
 import sqlite3
+import urllib.parse
 from typing import Any, Iterator
 
 import session_search as ss
+
+
+@dataclasses.dataclass(frozen=True)
+class AdapterHealth:
+    """Content-free health result for one local session-store adapter."""
+
+    source: str
+    status: str
+    candidate_stores: int
+    parsed_documents: int
+    zero_content_stores: int
+    error_stores: int
+
+
+def _adapter_candidates(home: pathlib.Path, source: str) -> list[pathlib.Path]:
+    """Return candidate store files without reading or exposing their content."""
+    if source == "claude":
+        return [
+            *home.glob(".claude/projects/**/*.jsonl"),
+            *home.glob(".claude/sessions/*.json"),
+        ]
+    if source == "codex":
+        return [
+            path
+            for path in (
+                home / ".codex" / "state_5.sqlite",
+                home / ".codex" / "history.jsonl",
+            )
+            if path.is_file()
+        ]
+    if source == "pi":
+        return list(home.glob(".pi/agent/sessions/**/*.jsonl"))
+    if source in {"vscode", "cursor"}:
+        app = "Code" if source == "vscode" else "Cursor"
+        root = home / "Library" / "Application Support" / app / "User"
+        return [
+            *root.glob("globalStorage/emptyWindowChatSessions/*.jsonl"),
+            *root.glob("globalStorage/state.vscdb"),
+            *root.glob("workspaceStorage/*/state.vscdb"),
+        ]
+    return []
+
+
+def _candidate_documents(
+    home: pathlib.Path,
+    source: str,
+    candidate: pathlib.Path,
+) -> Iterator[ss.Document]:
+    if source == "claude":
+        if candidate.suffix == ".jsonl":
+            yield from ss.iter_claude_jsonl(candidate, source)
+        else:
+            yield from ss.iter_json_session_file(candidate, source)
+    elif source == "codex":
+        if candidate.name == "state_5.sqlite":
+            yield from ss.iter_codex_threads(home)
+        else:
+            yield from ss.iter_codex_history(home, ss.codex_thread_context(home))
+    elif source == "pi":
+        yield from ss.iter_pi_jsonl(candidate)
+    elif candidate.suffix == ".jsonl":
+        yield from ss.iter_vscode_chat_jsonl(candidate, source)
+    else:
+        yield from ss.iter_vscode_state_db(candidate, source)
+
+
+def _candidate_has_format_errors(candidate: pathlib.Path) -> bool:
+    """Detect malformed serialized records without returning their contents."""
+    if candidate.suffix == ".jsonl":
+        with candidate.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    return True
+                if not isinstance(parsed, dict):
+                    return True
+        return False
+    if candidate.suffix == ".json":
+        json.loads(candidate.read_text(encoding="utf-8", errors="ignore"))
+    return False
+
+
+def adapter_health(
+    home: pathlib.Path,
+    sources: set[str] | None = None,
+) -> list[AdapterHealth]:
+    """Classify adapter stores without returning local paths or session text."""
+    requested = sources or set(ss.SUPPORTED_SOURCES)
+    results: list[AdapterHealth] = []
+    for source in ss.SUPPORTED_SOURCES:
+        if source not in requested:
+            continue
+        candidates = ss._adapter_candidates(home, source)
+        parsed = 0
+        zero_content = 0
+        errors = 0
+        for candidate in candidates:
+            try:
+                count = sum(
+                    1
+                    for _document in _candidate_documents(
+                        home,
+                        source,
+                        candidate,
+                    )
+                )
+                if _candidate_has_format_errors(candidate):
+                    errors += 1
+            # Diagnostics must degrade without returning parser exceptions,
+            # because those messages can contain private archive paths.
+            except Exception:
+                errors += 1
+                count = 0
+            parsed += count
+            if count == 0:
+                zero_content += 1
+        if not candidates:
+            status = "missing_store"
+        elif parsed and not zero_content and not errors:
+            status = "parsed_documents"
+        elif parsed:
+            status = "partial_store_drift"
+        else:
+            status = "candidate_store_zero_content"
+        results.append(
+            AdapterHealth(
+                source=source,
+                status=status,
+                candidate_stores=len(candidates),
+                parsed_documents=parsed,
+                zero_content_stores=zero_content,
+                error_stores=errors,
+            )
+        )
+    return results
 
 
 def iter_codex(home: pathlib.Path) -> Iterator[Document]:
@@ -494,6 +633,7 @@ def iter_vscode_state_db(path: pathlib.Path, source: str) -> Iterator[Document]:
     conn = ss.connect_ro_sqlite(path)
     if conn is None:
         return
+    cwd = vscode_workspace_cwd(path)
     try:
         try:
             if "ItemTable" not in ss.table_names(conn):
@@ -526,7 +666,7 @@ def iter_vscode_state_db(path: pathlib.Path, source: str) -> Iterator[Document]:
                         session_id=session_id,
                         title=ss.derive_document_title(title, text),
                         path=str(path),
-                        cwd="",
+                        cwd=cwd,
                         role="state",
                         ts=None,
                         text=text,
@@ -536,6 +676,32 @@ def iter_vscode_state_db(path: pathlib.Path, source: str) -> Iterator[Document]:
                 continue
     finally:
         conn.close()
+
+
+def vscode_workspace_cwd(path: pathlib.Path) -> str:
+    """Resolve a VS Code workspace-store path without exposing storage hashes."""
+    metadata = path.parent / "workspace.json"
+    if not metadata.is_file():
+        return ""
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    raw = payload.get("folder") or payload.get("workspace") or ""
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme == "file":
+        resolved = pathlib.Path(urllib.parse.unquote(parsed.path))
+    elif parsed.scheme:
+        return ""
+    else:
+        resolved = pathlib.Path(raw)
+    if resolved.suffix == ".code-workspace":
+        resolved = resolved.parent
+    return ss.sanitize_text(str(resolved))
 
 
 def iter_json_session_file(path: pathlib.Path, source: str) -> Iterator[Document]:

@@ -436,10 +436,14 @@ def unique_join(parts: Iterable[str], sep: str = "\n\n") -> str:
 def connect_db(db_path: pathlib.Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+    except sqlite3.Error:
+        conn.close()
+        raise
     return conn
 
 
@@ -474,10 +478,13 @@ def connect_ro_sqlite(path: pathlib.Path) -> sqlite3.Connection | None:
     if not path.exists():
         return None
     uri = f"file:{path}?mode=ro"
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(uri, uri=True)
         conn.execute("SELECT 1").fetchone()
     except sqlite3.Error:
+        if conn is not None:
+            conn.close()
         return None
     conn.row_factory = sqlite3.Row
     return conn
@@ -763,16 +770,35 @@ def _main(argv: list[str] | None = None) -> int:
         build_natural_parser().print_help()
         return 0
     known = {
-        "index", "search", "show", "resume", "handoff", "status", "capabilities", "demo",
+        "index", "search", "show", "resume", "handoff", "status", "capabilities", "doctor", "demo",
         "cards", "embed", "eval", "project",
         "archived", "archive", "unarchive", "archive-audit",
     }
+    # argparse permits global options before the subcommand. Detect that
+    # documented form before deciding that the invocation is natural search.
+    command_at = 0
+    leading_values: dict[str, str] = {}
+    while command_at < len(argv):
+        token = argv[command_at]
+        if token in {"--db", "--home"} and command_at + 1 < len(argv):
+            leading_values[token[2:]] = argv[command_at + 1]
+            command_at += 2
+            continue
+        if token.startswith(("--db=", "--home=")):
+            name, value = token[2:].split("=", 1)
+            leading_values[name] = value
+            command_at += 1
+            continue
+        break
+    explicit_command = argv[command_at] if command_at < len(argv) else ""
     if argv == ["refresh"]:
         argv = ["index", "--reset", *argv[1:]]
-    natural_followup = parse_natural_followup(argv)
+    natural_followup = parse_natural_followup(argv[command_at:])
     if natural_followup is not None:
+        if "db" in leading_values:
+            natural_followup.db = leading_values["db"]
         return int(natural_followup.func(natural_followup))
-    if argv and argv[0] not in known and argv[0] not in {"-h", "--help"}:
+    if argv and explicit_command not in known and argv[0] not in {"-h", "--help"}:
         args = parse_natural(argv)
         return int(args.func(args))
     parser = build_parser()
@@ -811,7 +837,8 @@ for _bucket in ("ss_adapters", "ss_retrieval", "ss_cards", "ss_dashboard", "ss_p
 del _bucket
 
 from ss_adapters import (  # noqa: E402
-    build_docs, codex_thread_context, decode_sqlite_value, extract_claude_turn,
+    AdapterHealth, _adapter_candidates, adapter_health, build_docs, codex_thread_context,
+    decode_sqlite_value, extract_claude_turn,
     extract_content_text, extract_generic_chat_text, extract_pi_content_text,
     extract_pi_entry_text, extract_request_objects, extract_vscode_assistant_response,
     extract_vscode_docs, extract_vscode_user_message, is_chat_path, is_patch_key, iter_claude,
@@ -855,7 +882,7 @@ from ss_cards import (  # noqa: E402
 )
 
 from ss_dashboard import (  # noqa: E402
-    _card_field_ready, _dedupe_card_path, _humanize_path_part, _short_topic,
+    PROJECT_PAGE_MAX, _card_field_ready, _dedupe_card_path, _humanize_path_part, _short_topic,
     _strip_card_prefixes, alternate_harness_line, archived_session_results, card_visible_text,
     catch_up_dashboard_cards, dashboard_cell, dashboard_clean_text, dashboard_is_interactive,
     dashboard_key_terms, dashboard_pick_about, dashboard_pick_resume, dashboard_pick_state,
@@ -884,7 +911,7 @@ from ss_packets import (  # noqa: E402
 
 from ss_cli import (  # noqa: E402
     build_natural_parser, build_parser, cmd_archive_audit, cmd_archived, cmd_capabilities,
-    cmd_cards, cmd_continue, cmd_dashboard, cmd_demo, cmd_embed, cmd_eval, cmd_handoff,
+    cmd_cards, cmd_continue, cmd_dashboard, cmd_demo, cmd_doctor, cmd_embed, cmd_eval, cmd_handoff,
     cmd_index, cmd_natural, cmd_project, cmd_resume, cmd_search, cmd_set_archive, cmd_show,
     cmd_status, eval_rule_matches, eval_text_for_result, eval_title, first_numeric_selector,
     load_eval_cases, normalize_eval_terms, parse_natural, parse_natural_followup,

@@ -2117,20 +2117,28 @@ class OutputShapeTest(unittest.TestCase):
         conn.close()
 
     def test_look_does_not_unarchive(self):
-        conn = make_conn_with_docs(
-            [doc(doc_id="archived", session_id="archived", text="Closed work.", ts=100)]
-        )
-        ss.set_session_archive_status(conn, "codex", "archived", True, "manual")
-        conn.commit()
-        row = conn.execute("SELECT * FROM documents WHERE doc_id = 'archived'").fetchone()
-        with mock.patch.object(ss, "session_lock", return_value=contextlib.nullcontext()), mock.patch.object(
-            ss, "connect_selector_db", return_value=(pathlib.Path(":memory:"), conn)
-        ), mock.patch.object(ss, "selected_row", return_value=row), mock.patch.object(
-            ss, "query_from_selector", return_value=""
-        ), mock.patch.object(ss, "print_session_card_detail"), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(ss.cmd_show(ss.argparse.Namespace(db=":memory:", doc_id="1")), 0)
-        self.assertTrue(ss.session_is_archived(conn, "codex", "archived"))
-        conn.close()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = pathlib.Path(tmpdir) / "look.sqlite"
+            conn = ss.connect_db(db)
+            ss.init_db(conn)
+            ss.upsert_documents(
+                conn,
+                [doc(doc_id="archived", session_id="archived", text="Closed work.", ts=100)],
+            )
+            ss.set_session_archive_status(conn, "codex", "archived", True, "manual")
+            conn.commit()
+            conn.close()
+
+            with (
+                mock.patch.object(ss, "session_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(ss, "print_session_card_detail"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(ss.cmd_show(ss.argparse.Namespace(db=str(db), doc_id="archived")), 0)
+
+            check = ss.connect_db(db)
+            self.assertTrue(ss.session_is_archived(check, "codex", "archived"))
+            check.close()
 
     def test_result_summary_prints_last_user_message(self):
         conn = make_conn_with_docs(

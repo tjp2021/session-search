@@ -62,11 +62,17 @@ Confirm the installation:
 ```bash
 ss capabilities
 ss demo
+ss doctor
 ```
 
 `ss demo` proves the installed command without reading your history. It creates
 120 fictional records in a temporary database, exercises search and archive
 behavior, and removes the data when finished.
+
+`ss doctor` reports whether each local adapter found a store and parsed
+documents. It does not print store paths or session text. Use
+`ss doctor --strict` when a candidate store that yields no documents should
+fail an automated check.
 
 ## Recover your first session
 
@@ -101,6 +107,8 @@ instead.
 Inside the interactive dashboard, you can also:
 
 - Enter a number to get that session's open command.
+- Enter `pN` to open an older project bucket.
+- Enter `n` or `b` to move through a project with more than 200 sessions.
 - Type search words to replace the dashboard with matching sessions.
 - Enter `q` to leave.
 
@@ -119,6 +127,7 @@ Inside the interactive dashboard, you can also:
 | Return a listed session to active results | `ss unarchive N` |
 | Inspect archive-state problems safely | `ss archive-audit` |
 | Check index health | `ss status` |
+| Check adapter parsing health | `ss doctor` |
 | Show exact source capabilities | `ss capabilities` |
 | Run the isolated synthetic demo | `ss demo` |
 
@@ -481,6 +490,9 @@ Run ranking evaluations:
 
 ```bash
 .venv/bin/python session_search.py eval --mode fts
+.venv/bin/python tests/run_public_retrieval_eval.py --mode all \
+  --expected evidence/public-retrieval-v0.1.0.json
+.venv/bin/python tests/run_dashboard_latency_gate.py
 ```
 
 Refresh the index directly:

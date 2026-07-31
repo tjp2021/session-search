@@ -28,6 +28,7 @@ requirements.txt
 retrieval_eval.py
 schema_migrations.py
 scripts/check_public_privacy.py
+scripts/check_adapter_health.py
 scripts/export_public.py
 secret_patterns.py
 session_search.py
@@ -40,12 +41,15 @@ ss_packets.py
 ss_retrieval.py
 tests/benchmark_archive.py
 tests/benchmark_public.py
+tests/run_dashboard_latency_gate.py
+tests/run_installed_acceptance.py
 tests/run_public_card_quality_eval.py
 tests/run_public_retrieval_eval.py
 tests/test_adapter_pipeline.py
 tests/test_archive_concurrency.py
 tests/test_archive_intent.py
 tests/test_behavior_contracts.py
+tests/test_cli_resource_ownership.py
 tests/test_dashboard_summary_quality.py
 tests/test_dashboard_work_map.py
 tests/test_fault_reliability.py
@@ -56,4 +60,5 @@ tests/test_retrieval_metrics.py
 tests/test_secret_redaction.py
 tests/test_suite_integrity.py
 tests/test_summaries_opt_in.py
+tests/test_system_boundaries.py
 uv.lock

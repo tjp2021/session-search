@@ -276,64 +276,34 @@ def dashboard_pick_resume(
     return ""
 
 
-def _dashboard_project_scan_rows(
-    conn: sqlite3.Connection,
-    source_name: str = "all",
-    scan_limit: int = 250,
-) -> list[sqlite3.Row]:
-    sources = ("claude", "codex", "pi") if source_name == "all" else (source_name,)
-    placeholders = ",".join("?" for _source in sources)
-    return conn.execute(
-        f"""
-        WITH sessions AS (
-            SELECT d.source,
-                   d.session_id,
-                   MAX(COALESCE(d.ts, 0)) AS last_user_ts
-            FROM documents d
-            LEFT JOIN session_archive_status archive
-              ON archive.source = d.source
-             AND archive.session_id = d.session_id
-            WHERE d.source IN ({placeholders})
-              AND d.role = 'user'
-              AND TRIM(COALESCE(d.text, '')) != ''
-              AND d.path NOT LIKE '%/subagents/%'
-              AND COALESCE(archive.archived, 0) = 0
-            GROUP BY d.source, d.session_id
-            ORDER BY last_user_ts DESC
-            LIMIT ?
+PROJECT_PAGE_MAX = 200
+
+
+def _dashboard_sources(source_name: str) -> tuple[str, ...]:
+    return tuple(ss.SUPPORTED_SOURCES) if source_name == "all" else (source_name,)
+
+
+def _register_dashboard_sql_functions(conn: sqlite3.Connection) -> None:
+    conn.create_function(
+        "_ss_dashboard_project",
+        1,
+        lambda repo: ss.dashboard_project_label(str(repo or "")),
+        deterministic=True,
+    )
+    conn.create_function(
+        "_ss_dashboard_project_key",
+        1,
+        lambda project: ss.dashboard_clean_text(str(project or "")).casefold(),
+        deterministic=True,
+    )
+    conn.create_function(
+        "_ss_dashboard_project_noise",
+        2,
+        lambda project, repo: int(
+            ss.dashboard_project_is_noise(str(project or ""), str(repo or ""))
         ),
-        latest_user_rows AS (
-            SELECT sessions.last_user_ts,
-                   d.*,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY d.source, d.session_id
-                       ORDER BY COALESCE(d.ts, 0) DESC, d.doc_id DESC
-                   ) AS row_rank
-            FROM sessions
-            JOIN documents d
-              ON d.source = sessions.source
-             AND d.session_id = sessions.session_id
-            WHERE d.role = 'user'
-              AND TRIM(COALESCE(d.text, '')) != ''
-        )
-        SELECT latest_user_rows.*,
-               cards.repo AS cached_repo,
-               cards.last_active AS cached_last_active,
-               cards.what_this_was AS cached_about
-        FROM latest_user_rows
-        LEFT JOIN session_cards cards
-          ON cards.source = latest_user_rows.source
-         AND cards.session_id = latest_user_rows.session_id
-        WHERE latest_user_rows.row_rank = 1
-        ORDER BY latest_user_rows.last_user_ts DESC
-        """,
-        [*sources, max(1, int(scan_limit))],
-    ).fetchall()
-
-
-def _dashboard_row_project(row: sqlite3.Row) -> tuple[str, str]:
-    repo = str(row["cached_repo"] or "") or ss.location_label(row)
-    return ss.dashboard_project_label(repo), repo
+        deterministic=True,
+    )
 
 
 def dashboard_project_results(
@@ -341,27 +311,80 @@ def dashboard_project_results(
     project_name: str,
     limit: int = 200,
     source_name: str = "all",
-    scan_limit: int = 5000,
-) -> tuple[str, list[tuple[sqlite3.Row, float, str]]]:
-    """Return active sessions whose stable dashboard label matches one project."""
+    offset: int = 0,
+) -> tuple[str, list[tuple[sqlite3.Row, float, str]], int]:
+    """Return one bounded page and the full active total for a project."""
     requested = ss.dashboard_clean_text(project_name).casefold()
     if not requested:
-        return "", []
-    matched_name = ""
+        return "", [], 0
+    _register_dashboard_sql_functions(conn)
+    sources = _dashboard_sources(source_name)
+    placeholders = ",".join("?" for _source in sources)
+    page_limit = min(PROJECT_PAGE_MAX, max(1, int(limit)))
+    page_offset = max(0, int(offset))
+    rows = conn.execute(
+        f"""
+        WITH ranked_user_rows AS (
+            SELECT d.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY d.source, d.session_id
+                       ORDER BY COALESCE(d.ts, 0) DESC, d.doc_id DESC
+                   ) AS row_rank
+            FROM documents d
+            LEFT JOIN session_archive_status archive
+              ON archive.source = d.source
+             AND archive.session_id = d.session_id
+            WHERE d.source IN ({placeholders})
+              AND TRIM(COALESCE(d.text, '')) != ''
+              AND d.path NOT LIKE '%/subagents/%'
+              AND COALESCE(archive.archived, 0) = 0
+        ),
+        labeled AS (
+            SELECT ranked_user_rows.*,
+                   '' AS cached_repo,
+                   0 AS cached_last_active,
+                   '' AS cached_about,
+                   COALESCE(
+                       NULLIF(ranked_user_rows.cwd, ''),
+                       ranked_user_rows.path
+                   ) AS project_repo
+            FROM ranked_user_rows
+            WHERE ranked_user_rows.row_rank = 1
+        ),
+        matching AS (
+            SELECT labeled.*,
+                   _ss_dashboard_project(project_repo) AS project,
+                   MAX(
+                       COALESCE(labeled.ts, 0),
+                       COALESCE(labeled.cached_last_active, 0)
+                   ) AS activity_ts
+            FROM labeled
+            WHERE _ss_dashboard_project_key(
+                      _ss_dashboard_project(project_repo)
+                  ) = ?
+              AND _ss_dashboard_project_noise(
+                      _ss_dashboard_project(project_repo),
+                      project_repo
+                  ) = 0
+        )
+        SELECT matching.*,
+               COUNT(*) OVER () AS project_total
+        FROM matching
+        ORDER BY activity_ts DESC, source, session_id
+        LIMIT ? OFFSET ?
+        """,
+        [*sources, requested, page_limit, page_offset],
+    ).fetchall()
+    if not rows:
+        return "", [], 0
     results: list[tuple[sqlite3.Row, float, str]] = []
-    for row in _dashboard_project_scan_rows(conn, source_name, scan_limit):
-        project, repo = _dashboard_row_project(row)
-        if ss.dashboard_project_is_noise(project, repo) or project.casefold() != requested:
-            continue
-        matched_name = project
+    for row in rows:
         activity_ts = max(
-            int(row["last_user_ts"] or 0),
+            int(row["ts"] or 0),
             int(row["cached_last_active"] or 0),
         )
         results.append((row, ss.recency_boost(activity_ts), "project"))
-        if len(results) >= max(1, int(limit)):
-            break
-    return matched_name, results
+    return str(rows[0]["project"]), results, int(rows[0]["project_total"])
 
 
 def dashboard_project_summaries(
@@ -370,14 +393,75 @@ def dashboard_project_summaries(
     thread_limit: int = 10,
     project_scan_limit: int = 250,
 ) -> list[dict[str, Any]]:
-    """Build project rows without rebuilding every historical session card."""
-    scan_limit = max(int(thread_limit), int(project_scan_limit), 1)
-    scanned = _dashboard_project_scan_rows(conn, source_name, scan_limit)
-    groups: dict[str, dict[str, Any]] = {}
-    for row in scanned:
-        project, repo = _dashboard_row_project(row)
-        if ss.dashboard_project_is_noise(project, repo):
-            continue
+    """Aggregate every active indexed session without constructing cards."""
+    del thread_limit, project_scan_limit
+    _register_dashboard_sql_functions(conn)
+    sources = _dashboard_sources(source_name)
+    placeholders = ",".join("?" for _source in sources)
+    rows = conn.execute(
+        f"""
+        WITH ranked_user_rows AS (
+            SELECT d.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY d.source, d.session_id
+                       ORDER BY COALESCE(d.ts, 0) DESC, d.doc_id DESC
+                   ) AS row_rank
+            FROM documents d
+            LEFT JOIN session_archive_status archive
+              ON archive.source = d.source
+             AND archive.session_id = d.session_id
+            WHERE d.source IN ({placeholders})
+              AND TRIM(COALESCE(d.text, '')) != ''
+              AND d.path NOT LIKE '%/subagents/%'
+              AND COALESCE(archive.archived, 0) = 0
+        ),
+        labeled AS (
+            SELECT ranked_user_rows.*,
+                   '' AS cached_repo,
+                   0 AS cached_last_active,
+                   '' AS cached_about,
+                   COALESCE(
+                       NULLIF(ranked_user_rows.cwd, ''),
+                       ranked_user_rows.path
+                   ) AS project_repo,
+                   _ss_dashboard_project(
+                       COALESCE(
+                           NULLIF(ranked_user_rows.cwd, ''),
+                           ranked_user_rows.path
+                       )
+                   ) AS project
+            FROM ranked_user_rows
+            WHERE ranked_user_rows.row_rank = 1
+        ),
+        project_rows AS (
+            SELECT labeled.*,
+                   MAX(
+                       COALESCE(labeled.ts, 0),
+                       COALESCE(labeled.cached_last_active, 0)
+                   ) AS activity_ts,
+                   COUNT(*) OVER (PARTITION BY project) AS project_count,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY project
+                       ORDER BY
+                           MAX(
+                               COALESCE(labeled.ts, 0),
+                               COALESCE(labeled.cached_last_active, 0)
+                           ) DESC,
+                           source,
+                           session_id
+                   ) AS project_rank
+            FROM labeled
+            WHERE _ss_dashboard_project_noise(project, project_repo) = 0
+        )
+        SELECT *
+        FROM project_rows
+        WHERE project_rank = 1
+        ORDER BY activity_ts DESC, project COLLATE NOCASE
+        """,
+        [*sources],
+    ).fetchall()
+    projects: list[dict[str, Any]] = []
+    for row in rows:
         about = ss.clean_card_line(str(row["cached_about"] or ""), 160)
         if not about:
             title = ss.clean_card_line(str(row["title"] or ""), 160)
@@ -385,35 +469,18 @@ def dashboard_project_summaries(
                 about = title
             else:
                 about = ss.clean_card_line(str(row["text"] or "")[:500], 160)
-        last_active = max(
-            int(row["last_user_ts"] or 0),
-            int(row["cached_last_active"] or 0),
-        )
-        bucket = groups.setdefault(
-            project,
+        projects.append(
             {
-                "project": project,
-                "count": 0,
-                "latest_ts": last_active,
+                "project": str(row["project"]),
+                "count": int(row["project_count"]),
+                "latest_ts": int(row["activity_ts"] or 0),
                 "latest_about": about,
                 "latest_session_id": str(row["session_id"]),
                 "latest_source": str(row["source"]),
-                "repo": repo,
-            },
+                "repo": str(row["project_repo"] or ""),
+            }
         )
-        bucket["count"] += 1
-        ts = last_active
-        if ts >= int(bucket["latest_ts"] or 0):
-            bucket["latest_ts"] = ts
-            bucket["latest_about"] = about
-            bucket["latest_session_id"] = str(row["session_id"])
-            bucket["latest_source"] = str(row["source"])
-            bucket["repo"] = repo
-    ordered = sorted(
-        groups.values(),
-        key=lambda item: (-int(item["latest_ts"] or 0), str(item["project"]).lower()),
-    )
-    return ordered
+    return projects
 
 
 def dashboard_summary(
@@ -672,20 +739,24 @@ def recent_session_results(
     source_name: str = "all",
     archived_only: bool = False,
 ) -> list[tuple[sqlite3.Row, float, str]]:
-    sources = ("claude", "codex", "pi") if source_name == "all" else (source_name,)
+    sources = tuple(ss.SUPPORTED_SOURCES) if source_name == "all" else (source_name,)
     placeholders = ",".join("?" for _ in sources)
     candidates = conn.execute(
         f"""
-        SELECT source, session_id, MAX(COALESCE(ts, 0)) AS last_user_ts
-        FROM documents
-        WHERE source IN ({placeholders})
-          AND role = 'user'
-          AND path NOT LIKE '%/subagents/%'
-        GROUP BY source, session_id
-        ORDER BY last_user_ts DESC
+        SELECT d.source, d.session_id,
+               MAX(COALESCE(d.ts, 0)) AS last_activity_ts
+        FROM documents d
+        LEFT JOIN session_archive_status archive
+          ON archive.source = d.source
+         AND archive.session_id = d.session_id
+        WHERE d.source IN ({placeholders})
+          AND d.path NOT LIKE '%/subagents/%'
+          AND COALESCE(archive.archived, 0) = ?
+        GROUP BY d.source, d.session_id
+        ORDER BY last_activity_ts DESC
         LIMIT ?
         """,
-        [*sources, max(limit * 5, 50)],
+        [*sources, int(archived_only), max(limit * 5, 50)],
     )
     results: list[tuple[sqlite3.Row, float, str]] = []
     for candidate in candidates:
@@ -696,8 +767,6 @@ def recent_session_results(
         if archived != archived_only:
             continue
         rows = ss.session_rows(conn, row)
-        if not ss.last_user_message(rows, row):
-            continue
         activity_ts = ss.last_user_prompt_ts(rows, row)
         results.append((row, ss.recency_boost(activity_ts), "recent"))
         if len(results) >= limit:
@@ -801,6 +870,8 @@ def print_dashboard(
     archived_view: bool = False,
     project_summaries: list[dict[str, Any]] | None = None,
     heading: str = "",
+    total_threads: int | None = None,
+    page_offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Restart recovery screen: sparse, grouped, scannable."""
     width = ss.dashboard_terminal_width()
@@ -873,7 +944,13 @@ def print_dashboard(
             more_projects.append(item)
         more_projects = more_projects[:8]
 
-    count_line = f"{len(thread_entries)} recent thread{'s' if len(thread_entries) != 1 else ''} · open with: ss open N"
+    total = len(thread_entries) if total_threads is None else max(len(thread_entries), int(total_threads))
+    if total > len(thread_entries) or page_offset:
+        first = page_offset + 1
+        last = page_offset + len(thread_entries)
+        count_line = f"{first}-{last} shown of {total} threads · open with: ss open N"
+    else:
+        count_line = f"{len(thread_entries)} recent thread{'s' if len(thread_entries) != 1 else ''} · open with: ss open N"
     for line in dashboard_wrapped_lines(count_line, width):
         print(line)
     print()
@@ -1088,6 +1165,13 @@ def dashboard_project_label(repo: str) -> str:
     raw = ss.sanitize_text(repo)
     if not raw or raw in {"unknown", "unknown from index"}:
         return "Unknown folder"
+    normalized = raw.replace("\\", "/").lower()
+    if normalized.endswith("/globalstorage/state.vscdb"):
+        tool = "Cursor" if "/cursor/" in normalized else "VS Code"
+        return f"{tool} / Global"
+    if "/workspacestorage/" in normalized and normalized.endswith("/state.vscdb"):
+        tool = "Cursor" if "/cursor/" in normalized else "VS Code"
+        return f"{tool} / Unknown workspace"
     path = pathlib.PurePath(raw)
     parts = [part for part in path.parts if part not in {"/", "\\"}]
     if not parts:
@@ -1150,7 +1234,11 @@ def dashboard_prompt(args: argparse.Namespace) -> int:
         return 0
     while True:
         try:
-            choice = input("Open N, choose project Pn, type search words, or q: ").strip()
+            if getattr(args, "current_project", ""):
+                prompt = "Open N, n next, b back, type search words, or q: "
+            else:
+                prompt = "Open N, choose project Pn, type search words, or q: "
+            choice = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -1164,18 +1252,76 @@ def dashboard_prompt(args: argparse.Namespace) -> int:
                 print(f"Project selector not found: {choice}")
                 continue
             print()
-            return ss.cmd_project(
-                argparse.Namespace(
+            project_args = argparse.Namespace(
+                db=args.db,
+                home=args.home,
+                project=str(project_choices[project_index]["project"]),
+                project_choices=project_choices,
+                limit=ss.PROJECT_PAGE_MAX,
+                source=args.source,
+                mode=args.mode,
+                no_refresh=True,
+                page=1,
+                prompt=False,
+            )
+            status = ss.cmd_project(project_args)
+            if status == 0:
+                args.current_project = getattr(project_args, "current_project", "")
+                args.project_page = getattr(project_args, "project_page", 1)
+                args.project_total = getattr(project_args, "project_total", 0)
+                args.project_limit = getattr(project_args, "project_limit", ss.PROJECT_PAGE_MAX)
+            continue
+        if choice.lower() in {"n", "next", "b", "back", "prev", "previous"} and getattr(
+            args, "current_project", ""
+        ):
+            is_back = choice.lower() in {"b", "back", "prev", "previous"}
+            current_page = int(getattr(args, "project_page", 1))
+            if is_back and current_page <= 1:
+                print()
+                dashboard_args = argparse.Namespace(
                     db=args.db,
                     home=args.home,
-                    project=str(project_choices[project_index]["project"]),
-                    project_choices=project_choices,
-                    limit=200,
+                    no_refresh=True,
+                    archived=False,
+                    limit=args.limit,
                     source=args.source,
                     mode=args.mode,
-                    no_refresh=True,
+                    prompt=False,
                 )
+                status = ss.cmd_dashboard(dashboard_args)
+                if status == 0:
+                    args.project_choices = list(
+                        getattr(dashboard_args, "project_choices", []) or []
+                    )
+                    args.current_project = ""
+                    args.project_page = 1
+                    args.project_total = 0
+                continue
+            direction = -1 if is_back else 1
+            next_page = max(1, current_page + direction)
+            page_limit = int(getattr(args, "project_limit", ss.PROJECT_PAGE_MAX))
+            if (next_page - 1) * page_limit >= int(getattr(args, "project_total", 0)):
+                print("No more project sessions.")
+                continue
+            print()
+            project_args = argparse.Namespace(
+                db=args.db,
+                home=args.home,
+                project=args.current_project,
+                project_choices=list(getattr(args, "project_choices", []) or []),
+                limit=page_limit,
+                source=args.source,
+                mode=args.mode,
+                no_refresh=True,
+                page=next_page,
+                prompt=False,
             )
+            status = ss.cmd_project(project_args)
+            if status == 0:
+                args.project_page = project_args.project_page
+                args.project_total = project_args.project_total
+                args.project_limit = project_args.project_limit
+            continue
         if choice.isdigit():
             print()
             return ss.cmd_resume(argparse.Namespace(db=args.db, selector=choice))
@@ -1199,17 +1345,25 @@ def dashboard_prompt(args: argparse.Namespace) -> int:
             project_value = " ".join(tokens[1:]).strip()
             if project_value:
                 print()
-                return ss.cmd_project(
-                    argparse.Namespace(
-                        db=args.db,
-                        home=args.home,
-                        project=project_value,
-                        limit=200,
-                        source=args.source,
-                        mode=args.mode,
-                        no_refresh=True,
-                    )
+                project_args = argparse.Namespace(
+                    db=args.db,
+                    home=args.home,
+                    project=project_value,
+                    project_choices=list(getattr(args, "project_choices", []) or []),
+                    limit=ss.PROJECT_PAGE_MAX,
+                    source=args.source,
+                    mode=args.mode,
+                    no_refresh=True,
+                    page=1,
+                    prompt=False,
                 )
+                status = ss.cmd_project(project_args)
+                if status == 0:
+                    args.current_project = project_args.current_project
+                    args.project_page = project_args.project_page
+                    args.project_total = project_args.project_total
+                    args.project_limit = project_args.project_limit
+                continue
         followup = ss.parse_natural_followup(tokens)
         if followup is not None:
             followup.db = args.db

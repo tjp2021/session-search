@@ -1,7 +1,8 @@
 {
   "corpus": {
     "queries": 80,
-    "sessions": 120
+    "sessions": 120,
+    "sha256": "b92d228fb2d600e9a1ea27d45e7a60defa65c0524fdc045db9614fa13d684248"
   },
   "modes": {
     "fts": {
