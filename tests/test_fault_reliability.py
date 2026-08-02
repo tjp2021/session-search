@@ -405,10 +405,12 @@ class PlatformLockTest(unittest.TestCase):
                 process.join(5)
             self.assertEqual(process.exitcode, 0)
 
-    def test_mac_lock_acquires_and_releases(self):
-        with tempfile.TemporaryDirectory() as temp:
-            with platform_lock.file_lock(pathlib.Path(temp) / "lock", timeout=0.1):
-                self.assertTrue((pathlib.Path(temp) / "lock").exists())
+    def test_supported_platform_lock_acquires_and_releases(self):
+        for supported in ("darwin", "linux"):
+            with self.subTest(platform=supported), tempfile.TemporaryDirectory() as temp:
+                with mock.patch.object(platform_lock.sys, "platform", supported):
+                    with platform_lock.file_lock(pathlib.Path(temp) / "lock", timeout=0.1):
+                        self.assertTrue((pathlib.Path(temp) / "lock").exists())
 
     def test_unsupported_platform_fails_clearly(self):
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(

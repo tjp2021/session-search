@@ -1,4 +1,4 @@
-"""Bounded macOS file locking for session-search."""
+"""Bounded POSIX file locking for session-search."""
 
 from __future__ import annotations
 
@@ -20,8 +20,10 @@ class UnsupportedPlatform(RuntimeError):
 
 @contextlib.contextmanager
 def file_lock(path: pathlib.Path, shared: bool = False, timeout: float = 5.0) -> Iterator[None]:
-    if sys.platform != "darwin":
-        raise UnsupportedPlatform(f"session-search locking supports macOS; found {sys.platform}")
+    if sys.platform not in {"darwin", "linux"}:
+        raise UnsupportedPlatform(
+            f"session-search locking supports macOS and Linux; found {sys.platform}"
+        )
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)

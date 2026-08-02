@@ -32,14 +32,14 @@ The proof is public: the [case study](docs/case-study.md),
 [privacy tests](tests/test_secret_redaction.py), and
 [current CI results](../../actions) ship with the repository.
 
-Indexing, search, ranking, and evidence-based session cards run on your Mac.
+Indexing, search, ranking, and evidence-based session cards run on macOS and Linux.
 Optional model summaries send selected session text to OpenRouter only after
 you turn on two settings. See
 [What leaves your machine](#what-leaves-your-machine).
 
 ## Install
 
-Session Search supports macOS and Python 3.11 or newer. This design-partner
+Session Search supports macOS, Linux, and Python 3.11 or newer. This design-partner
 command installs the latest public `main` branch from GitHub:
 
 ```bash

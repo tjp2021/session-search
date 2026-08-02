@@ -91,7 +91,7 @@ fact.
 
 ## Current boundary
 
-This release supports macOS. Claude Code, Codex, and Pi have proven native
+This release supports macOS and Linux. Claude Code, Codex, and Pi have proven native
 reopening.
 VS Code/Copilot and Cursor remain searchable and support packet continuation,
 but exact native reopening isn't claimed. Codex assistant output is partially
