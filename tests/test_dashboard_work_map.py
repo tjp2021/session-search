@@ -72,6 +72,20 @@ class DashboardWorkMapContracts(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
+    def test_interactive_prompts_fit_narrow_and_wide_terminals(self) -> None:
+        cases = (
+            (40, False, "Open N, Pn, search, or q: "),
+            (40, True, "Open N, n, b, search, or q: "),
+            (80, False, "Open N, choose project Pn, type search words, or q: "),
+            (80, True, "Open N, n next, b back, type search words, or q: "),
+        )
+        for width, in_project, expected in cases:
+            with self.subTest(width=width, in_project=in_project):
+                with mock.patch.object(ss, "dashboard_terminal_width", return_value=width):
+                    prompt = ss.dashboard_prompt_text(in_project=in_project)
+                self.assertEqual(prompt, expected)
+                self.assertLessEqual(wcswidth(prompt), width)
+
     def test_explicit_limit_returns_exactly_n_sessions(self) -> None:
         for index in range(12):
             _seed_session(

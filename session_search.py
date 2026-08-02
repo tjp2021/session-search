@@ -165,7 +165,9 @@ ACTION_ANCHOR_TERMS = {
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_+#.-]*", re.I)
 BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{300,}={0,2}")
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Covers C0, DEL, and the C1 block. U+009B is the single-character CSI, so
+# leaving C1 in place would let stored text drive the terminal on its own.
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 STOP_WORDS = {
     "a",
     "about",
@@ -889,7 +891,7 @@ from ss_dashboard import (  # noqa: E402
     dashboard_project_is_noise, dashboard_project_label, dashboard_project_results,
     dashboard_project_summaries, dashboard_prompt, dashboard_relative_time,
     dashboard_sentences, dashboard_short_tool,
-    dashboard_summary, dashboard_terminal_width, dashboard_topic, evidence_terms,
+    dashboard_summary, dashboard_terminal_width, dashboard_prompt_text, dashboard_topic, evidence_terms,
     evidence_terms_from_text, hit_count, iter_dashboard_updates, location_label,
     owner_action_label, print_dashboard, print_dashboard_table, print_results,
     print_session_card_detail, recent_session_results, refresh_dashboard_index,
@@ -915,7 +917,7 @@ from ss_cli import (  # noqa: E402
     cmd_index, cmd_natural, cmd_project, cmd_resume, cmd_search, cmd_set_archive, cmd_show,
     cmd_status, eval_rule_matches, eval_text_for_result, eval_title, first_numeric_selector,
     load_eval_cases, normalize_eval_terms, parse_natural, parse_natural_followup,
-    result_rank_for_rules, run_search,
+    quarantine_damaged_index, result_rank_for_rules, run_search,
 )
 
 # Back-compat alias: older call sites referenced ollama_summarize().

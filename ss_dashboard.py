@@ -1229,15 +1229,26 @@ def dashboard_is_interactive() -> bool:
         return False
 
 
+def dashboard_prompt_text(*, in_project: bool) -> str:
+    """Keep the input prompt inside the same terminal-width contract as cards."""
+    width = ss.dashboard_terminal_width()
+    if in_project:
+        long = "Open N, n next, b back, type search words, or q: "
+        short = "Open N, n, b, search, or q: "
+    else:
+        long = "Open N, choose project Pn, type search words, or q: "
+        short = "Open N, Pn, search, or q: "
+    return long if dashboard_display_width(long) <= width else short
+
+
 def dashboard_prompt(args: argparse.Namespace) -> int:
     if not ss.dashboard_is_interactive():
         return 0
     while True:
         try:
-            if getattr(args, "current_project", ""):
-                prompt = "Open N, n next, b back, type search words, or q: "
-            else:
-                prompt = "Open N, choose project Pn, type search words, or q: "
+            prompt = ss.dashboard_prompt_text(
+                in_project=bool(getattr(args, "current_project", ""))
+            )
             choice = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()

@@ -10,14 +10,21 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import shutil
 import sqlite3
 import sys
 from typing import Any
 from archive_intent import PARSER_VERSION as ARCHIVE_INTENT_VERSION
-from archive_store import immediate_transaction, quick_check
+from archive_store import StorageFailure, immediate_transaction, quick_check
 from adapter_capabilities import render_capabilities
 
 import session_search as ss
+
+
+def print_selector_not_found(selector: str) -> None:
+    print(f"Not found: {selector}", file=sys.stderr)
+    if selector.isdigit():
+        print("Run a fresh search first: ss fresh <what you remember>", file=sys.stderr)
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -166,7 +173,7 @@ def cmd_set_archive(args: argparse.Namespace) -> int:
         try:
             row = ss.selected_row(conn, args.selector)
             if row is None:
-                print(f"Not found: {args.selector}", file=sys.stderr)
+                print_selector_not_found(args.selector)
                 return 2
             archived = bool(args.archived)
             try:
@@ -197,10 +204,54 @@ def cmd_set_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def quarantine_damaged_index(db_path: pathlib.Path) -> pathlib.Path | None:
+    """Move an unreadable index aside so ``--reset`` can still rebuild it.
+
+    An interrupted index run can leave a file SQLite refuses to open. The
+    index is derived data, and ``--reset`` already means drop and rebuild,
+    so the damaged file is quarantined rather than blocking recovery.
+    """
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            # PRAGMA schema_version only reads the header cookie, so a torn
+            # page from an interrupted write passes it and then kills the
+            # rebuild. quick_check walks the b-trees and catches that.
+            quick_check(conn)
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        # Busy, locked, read-only, and I/O failures do not prove corruption.
+        # Fail safely and leave the existing index in place.
+        raise
+    except (sqlite3.DatabaseError, StorageFailure):
+        damaged = db_path.with_name(db_path.name + ".damaged")
+        # A stale quarantine slot must never block recovery, even when a
+        # previous run left a directory or a special file at that name.
+        if damaged.is_dir() and not damaged.is_symlink():
+            shutil.rmtree(damaged, ignore_errors=True)
+        else:
+            try:
+                damaged.unlink(missing_ok=True)
+            except OSError:
+                pass
+        db_path.replace(damaged)
+        for suffix in ("-wal", "-shm", "-journal"):
+            db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+        return damaged
+    return None
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     with ss.session_lock(shared=False):
         db_path = ss.expand(args.db)
         home = ss.expand(args.home)
+        if args.reset:
+            damaged = ss.quarantine_damaged_index(db_path)
+            if damaged is not None and not args.quiet:
+                print(f"Unreadable index moved aside: {damaged}")
         conn = ss.connect_db(db_path)
         try:
             if args.reset:
@@ -290,7 +341,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         try:
             row = ss.selected_row(conn, args.doc_id)
             if row is None:
-                print(f"Not found: {args.doc_id}", file=sys.stderr)
+                print_selector_not_found(args.doc_id)
                 return 2
             query = ss.query_from_selector(args.doc_id)
             card = ss.session_card_for_result(conn, row, query)
@@ -323,7 +374,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         try:
             row = ss.selected_row(conn, args.selector)
             if row is None:
-                print(f"Not found: {args.selector}", file=sys.stderr)
+                print_selector_not_found(args.selector)
                 return 2
             ss.mark_cli_resume(conn, row, args.selector, "cli-open")
             ss.print_resume_instructions(
@@ -355,7 +406,7 @@ def cmd_continue(args: argparse.Namespace) -> int:
         try:
             row = ss.selected_row(conn, args.selector)
             if row is None:
-                print(f"Not found: {args.selector}", file=sys.stderr)
+                print_selector_not_found(args.selector)
                 return 2
             ss.mark_cli_resume(conn, row, args.selector, "cli-continue")
             if not target or (
@@ -395,7 +446,7 @@ def cmd_handoff(args: argparse.Namespace) -> int:
         try:
             row = ss.selected_row(conn, args.selector)
             if row is None:
-                print(f"Not found: {args.selector}", file=sys.stderr)
+                print_selector_not_found(args.selector)
                 return 2
 
             query = ss.query_from_selector(args.selector)

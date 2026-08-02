@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import contextlib
 import datetime as dt
 import io
@@ -148,6 +149,21 @@ class NaturalFollowupParserTest(unittest.TestCase):
 
     def test_plain_search_does_not_parse_as_followup(self):
         self.assertIsNone(ss.parse_natural_followup(["true", "health", "deploy"]))
+
+    def test_missing_numeric_selector_prints_recovery_instruction(self):
+        conn = make_conn_with_docs([])
+        out = io.StringIO()
+        try:
+            with (
+                mock.patch.object(ss, "connect_selector_db", return_value=(pathlib.Path(":memory:"), conn)),
+                contextlib.redirect_stderr(out),
+            ):
+                status = ss.cmd_resume(argparse.Namespace(db=":memory:", selector="1"))
+        finally:
+            conn.close()
+        self.assertEqual(status, 2)
+        self.assertIn("Not found: 1", out.getvalue())
+        self.assertIn("ss fresh <what you remember>", out.getvalue())
 
 
 class QueryTermTest(unittest.TestCase):

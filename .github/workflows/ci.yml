@@ -9,8 +9,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-latest, ubuntu-latest]
         python: ["3.11", "3.13"]
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,15 +36,28 @@ jobs:
       - run: ss demo
 
   package:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: python -m pip install build
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install build "pexpect>=4.9,<5" "wcwidth>=0.2,<1"
       - run: python -m build
+      - run: git worktree add /tmp/session-search-v020 72e26f0
+      - run: python -m build --outdir /tmp/session-search-v020-dist /tmp/session-search-v020
       - run: python -m venv /tmp/session-search-install
+      # Installed on purpose without the semantic extra. The journeys below
+      # are bounded at 90 seconds and must not reach the network, so they run
+      # with semantic retrieval unavailable. The test job above covers
+      # semantic and hybrid retrieval against the published evidence.
       - run: /tmp/session-search-install/bin/pip install dist/*.whl
       - run: /tmp/session-search-install/bin/ss capabilities
       - run: /tmp/session-search-install/bin/ss demo
@@ -51,3 +65,9 @@ jobs:
         working-directory: /tmp
       - run: /tmp/session-search-install/bin/python ${{ github.workspace }}/tests/run_installed_acceptance.py --ss /tmp/session-search-install/bin/ss
         working-directory: /tmp
+      - run: python ${{ github.workspace }}/tests/run_task_usability_acceptance.py --ss /tmp/session-search-install/bin/ss
+        working-directory: /tmp
+        timeout-minutes: 2
+      - run: python ${{ github.workspace }}/tests/run_upgrade_acceptance.py --previous-wheel /tmp/session-search-v020-dist/*.whl --candidate-wheel ${{ github.workspace }}/dist/*.whl
+        working-directory: /tmp
+        timeout-minutes: 2

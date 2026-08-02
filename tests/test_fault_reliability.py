@@ -1,3 +1,4 @@
+import argparse
 import json
 import errno
 import contextlib
@@ -440,6 +441,149 @@ class PlatformLockTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 with platform_lock.file_lock(pathlib.Path(temp) / "lock"):
                     pass
+
+
+class DamagedIndexRecoveryTest(unittest.TestCase):
+    """An interrupted index must not trap the user in an unusable state."""
+
+    def test_reset_quarantines_an_unreadable_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = pathlib.Path(temp) / "sessions.sqlite"
+            db.write_bytes(b"SQLite format 3\x00interrupted-index" + b"\x00" * 512)
+            (db.parent / f"{db.name}-wal").write_bytes(b"stale")
+            damaged = ss.quarantine_damaged_index(db)
+            self.assertEqual(damaged, db.parent / "sessions.sqlite.damaged")
+            self.assertFalse(db.exists())
+            self.assertFalse((db.parent / f"{db.name}-wal").exists())
+            self.assertTrue(damaged.exists())
+
+    def test_healthy_index_is_never_moved_aside(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = pathlib.Path(temp) / "sessions.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE keep (id INTEGER)")
+            conn.commit()
+            conn.close()
+            self.assertIsNone(ss.quarantine_damaged_index(db))
+            self.assertTrue(db.exists())
+            self.assertFalse((db.parent / "sessions.sqlite.damaged").exists())
+
+    def test_healthy_locked_index_is_never_quarantined(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = pathlib.Path(temp) / "sessions.sqlite"
+            holder = sqlite3.connect(db)
+            holder.execute("CREATE TABLE proof(value TEXT)")
+            holder.execute("INSERT INTO proof VALUES('intact')")
+            holder.commit()
+            holder.execute("BEGIN EXCLUSIVE")
+            holder.execute("INSERT INTO proof VALUES('inflight')")
+
+            real_connect = sqlite3.connect
+
+            def connect_with_short_timeout(path):
+                return real_connect(path, timeout=0.05)
+
+            try:
+                with mock.patch.object(
+                    ss.sqlite3, "connect", side_effect=connect_with_short_timeout
+                ):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        ss.quarantine_damaged_index(db)
+            finally:
+                holder.rollback()
+                holder.close()
+
+            self.assertTrue(db.exists())
+            self.assertFalse(db.with_name(db.name + ".damaged").exists())
+            check = sqlite3.connect(db)
+            self.assertEqual(
+                check.execute("SELECT value FROM proof").fetchall(), [("intact",)]
+            )
+            check.close()
+
+    def test_torn_page_is_quarantined_not_just_a_bad_header(self):
+        """An interrupted write usually tears a page, not the header.
+
+        PRAGMA schema_version reads only the header cookie, so it passes a
+        torn page and the rebuild then dies. The probe must walk the b-trees.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            db = pathlib.Path(temp) / "sessions.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT)")
+            conn.executemany(
+                "INSERT INTO documents (text) VALUES (?)", [("x" * 400,) for _ in range(1500)]
+            )
+            conn.commit()
+            conn.close()
+            page = 4096
+            raw = bytearray(db.read_bytes())
+            self.assertGreater(len(raw), page * 4, "fixture must span several pages")
+            raw[page * 3 : page * 4] = b"\x00" * page
+            db.write_bytes(bytes(raw))
+
+            # The old probe cannot see this damage.
+            conn = sqlite3.connect(db)
+            self.assertIsNotNone(conn.execute("PRAGMA schema_version").fetchone())
+            conn.close()
+
+            damaged = ss.quarantine_damaged_index(db)
+            self.assertEqual(damaged, db.parent / "sessions.sqlite.damaged")
+            self.assertFalse(db.exists())
+
+    def test_torn_page_index_still_rebuilds_through_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            db = root / "sessions.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT)")
+            conn.executemany(
+                "INSERT INTO documents (text) VALUES (?)", [("x" * 400,) for _ in range(1500)]
+            )
+            conn.commit()
+            conn.close()
+            page = 4096
+            raw = bytearray(db.read_bytes())
+            raw[page * 3 : page * 4] = b"\x00" * page
+            db.write_bytes(bytes(raw))
+
+            args = argparse.Namespace(
+                db=str(db), home=str(root), source="all", reset=True, quiet=True
+            )
+            self.assertEqual(ss.cmd_index(args), 0)
+            self.assertTrue((root / "sessions.sqlite.damaged").exists())
+            conn = sqlite3.connect(db)
+            try:
+                tables = {
+                    row[0]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                }
+            finally:
+                conn.close()
+            self.assertIn("documents", tables)
+
+    def test_missing_index_needs_no_quarantine(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertIsNone(ss.quarantine_damaged_index(pathlib.Path(temp) / "absent.sqlite"))
+
+    def test_index_reset_rebuilds_after_an_interrupted_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            db = root / "sessions.sqlite"
+            db.write_bytes(b"SQLite format 3\x00interrupted-index" + b"\x00" * 512)
+            args = argparse.Namespace(
+                db=str(db), home=str(root), source="all", reset=True, quiet=True
+            )
+            self.assertEqual(ss.cmd_index(args), 0)
+            conn = sqlite3.connect(db)
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )}
+            finally:
+                conn.close()
+            self.assertIn("documents", tables)
+            self.assertTrue((root / "sessions.sqlite.damaged").exists())
 
 
 class CliFailureTest(unittest.TestCase):

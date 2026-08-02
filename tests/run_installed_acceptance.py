@@ -54,7 +54,7 @@ def main() -> int:
             "-c",
             (
                 "import importlib.metadata, requests, session_search; "
-                "assert importlib.metadata.version('session-search') == '0.2.1'; "
+                "assert importlib.metadata.version('session-search') == '0.2.2'; "
                 "print(session_search.__file__)"
             ),
         ],
@@ -148,7 +148,14 @@ def main() -> int:
             ],
             env,
         )
+        # The query itself is echoed in the header, so asserting on it passes
+        # even when no result card renders. Assert on rendered card content.
+        # The query is echoed in the header, so asserting on it alone passes
+        # even when no result card renders. Assert the card itself.
         require(searched.stdout, "offline-acceptance-needle", "natural search")
+        require(searched.stdout, "\n1. ", "search rendered a ranked result")
+        require(searched.stdout, "Found in: Claude Code", "search rendered a result card")
+        require(searched.stdout, "open exact session: ss open 1", "search rendered a recovery action")
 
         project_view = run(
             executable,
