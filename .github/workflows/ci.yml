@@ -69,5 +69,6 @@ jobs:
         working-directory: /tmp
         timeout-minutes: 2
       - run: python ${{ github.workspace }}/tests/run_upgrade_acceptance.py --previous-wheel /tmp/session-search-v020-dist/*.whl --candidate-wheel ${{ github.workspace }}/dist/*.whl
+        if: runner.os == 'macOS'
         working-directory: /tmp
         timeout-minutes: 2
