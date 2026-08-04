@@ -473,6 +473,15 @@ The installed `ss` command runs the `session_search:main` entry point
 declared in `pyproject.toml`. Normal use should go through `ss`. The lower-level commands
 below support development and diagnostics.
 
+Create the development environment first. A fresh clone has no `.venv`:
+
+```bash
+git clone https://github.com/tjp2021/session-search.git
+cd session-search
+python3 -m venv .venv
+.venv/bin/pip install -e ".[semantic,dev]"
+```
+
 Run the test suite:
 
 ```bash
@@ -489,10 +498,17 @@ Run branch coverage:
 Run ranking evaluations:
 
 ```bash
-.venv/bin/python session_search.py eval --mode fts
 .venv/bin/python tests/run_public_retrieval_eval.py --mode all \
   --expected evidence/public-retrieval-v0.1.0.json
 .venv/bin/python tests/run_dashboard_latency_gate.py
+```
+
+`session_search.py eval` also exists, but its default case file does not ship
+with the repository. It scores your own local sessions, so it reports every
+case as failed on a fresh clone. Point it at your own file to use it:
+
+```bash
+.venv/bin/python session_search.py eval --mode fts --file <your-cases.json>
 ```
 
 Refresh the index directly:

@@ -39,6 +39,7 @@ ss_config.py
 ss_dashboard.py
 ss_packets.py
 ss_retrieval.py
+uv.lock
 tests/benchmark_archive.py
 tests/benchmark_public.py
 tests/run_dashboard_latency_gate.py
@@ -58,9 +59,9 @@ tests/test_fault_reliability.py
 tests/test_natural_parser.py
 tests/test_productization.py
 tests/test_public_card_quality.py
+tests/test_readme_accuracy.py
 tests/test_retrieval_metrics.py
 tests/test_secret_redaction.py
 tests/test_suite_integrity.py
 tests/test_summaries_opt_in.py
 tests/test_system_boundaries.py
-uv.lock
