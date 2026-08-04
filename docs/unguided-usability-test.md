@@ -10,21 +10,29 @@ Use a fresh macOS or Linux account with Python 3.11 or newer, `pipx`, Git, and n
 
 ## Setup
 
-The facilitator runs these commands once per participant. They build a synthetic archive. They never read the participant's real session history.
+Run these commands in the participant's own shell, on the account they will use. The fixture must be readable by that account. They build a synthetic archive. They never read the participant's real session history.
 
 ```bash
 git clone https://github.com/tjp2021/session-search.git
 cd session-search
-python tests/run_task_usability_acceptance.py --prepare-pilot ~/ss-pilot
+python3 tests/run_task_usability_acceptance.py --prepare-pilot ~/ss-pilot
 ```
 
-The last command prints three `export` lines. Run those lines in the participant's shell, then build the index:
+Fixture preparation uses the standard library only, so it runs before SS is installed.
+
+The last command prints three `export` lines. Run those lines in the same shell, then build the index:
 
 ```bash
 ss index --reset
 ```
 
-Task 7 needs a separate account with no SS installed. The participant installs SS there with `pipx install session-search`.
+SS is not published on PyPI. Install it from the repository:
+
+```bash
+pipx install "session-search @ git+https://github.com/tjp2021/session-search.git"
+```
+
+Task 7 needs an account with no SS installed. The participant runs that same install command there, unaided.
 
 ## Tasks
 
