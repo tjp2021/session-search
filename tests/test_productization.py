@@ -86,8 +86,10 @@ class PortableConfigurationTest(unittest.TestCase):
             self.assertIn(name, modules, f"{name} is missing from py-modules")
             self.assertIn(f"{name}.py", manifest, f"{name}.py is missing from public-files.txt")
 
-    def test_default_paths_use_application_support(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+    def test_macos_defaults_use_application_support(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            ss_config.sys, "platform", "darwin"
+        ):
             home = pathlib.Path(tmpdir)
             paths = ss_config.resolve_paths(home=home, environ={})
         self.assertEqual(
