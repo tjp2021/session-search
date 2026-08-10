@@ -32,6 +32,9 @@ jobs:
       - run: python tests/run_public_card_quality_eval.py --expected evidence/public-card-quality-v0.1.0.json
       - run: python tests/run_public_retrieval_eval.py --mode all --expected evidence/public-retrieval-v0.1.0.json
       - run: python tests/benchmark_public.py --sessions 1000 --semantic --expected evidence/public-benchmark-v0.1.0.json
+        # The published baseline is a macOS hardware measurement. Running its
+        # model-build limit across unlike hosted runners creates false failures.
+        if: matrix.os == 'macos-latest' && matrix.python == '3.11'
       - run: python tests/run_dashboard_latency_gate.py
       - run: uv lock --check
       - run: python scripts/check_public_privacy.py
