@@ -27,8 +27,16 @@ def file_lock(path: pathlib.Path, shared: bool = False, timeout: float = 5.0) ->
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod((path.parent.stat().st_mode & 0o777) & 0o700)
+    except OSError:
+        pass
     deadline = time.monotonic() + timeout
     with path.open("a") as handle:
+        try:
+            path.chmod((path.stat().st_mode & 0o777) & 0o600)
+        except OSError:
+            pass
         mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         while True:
             try:

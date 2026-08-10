@@ -96,14 +96,28 @@ class InstalledLauncherTest(unittest.TestCase):
         self.assertTrue(execs, "launcher never execs an interpreter")
         for match in execs:
             target = match.group("target")
-            # Every exec must run session-search itself. A launcher that execs
-            # anything else is not this launcher.
-            self.assertIn("session_search", target, f"launcher execs {target!r}")
+            # Every exec must run the module or a distinct installed `ss`
+            # console script after the launcher resolves recursion safely.
+            if "PATH_REAL" in target:
+                self.assertIn("resolve_launcher_path", launcher)
+                self.assertIn('if [ "$PATH_REAL" != "$SELF_REAL" ]', launcher)
+            else:
+                self.assertIn("session_search", target, f"launcher execs {target!r}")
             self.assertLess(export_at, match.start(), "natural mode must be exported first")
             # The script's own comment calls this load-bearing: execing from the
             # private mirror lets that copy shadow the installed package.
             cd_root = launcher.rfind("cd /", 0, match.start())
             self.assertGreater(cd_root, export_at, f"exec at {match.start()} is not preceded by cd /")
+
+    def test_launcher_supports_modern_pipx_and_avoids_path_recursion(self):
+        launcher_path = ROOT / "ss_launcher.sh"
+        if not launcher_path.exists():
+            self.skipTest("private operator launcher is not part of the public package")
+        launcher = launcher_path.read_text(encoding="utf-8")
+        self.assertIn(".local/share/pipx/venvs/session-search/bin/python", launcher)
+        self.assertIn('PATH_SS="$(command -v ss', launcher)
+        self.assertIn("resolve_launcher_path", launcher)
+        self.assertIn('if [ "$PATH_REAL" != "$SELF_REAL" ]', launcher)
 
     def test_bare_python_entrypoint_uses_dashboard_without_environment_flag(self):
         with mock.patch.object(ss, "cmd_natural", return_value=0) as natural:

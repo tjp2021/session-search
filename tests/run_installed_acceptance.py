@@ -55,6 +55,7 @@ def main() -> int:
             (
                 "import importlib.metadata, requests, session_search; "
                 "assert importlib.metadata.version('session-search') == '0.2.2'; "
+                "assert session_search.DEFAULT_EVALS.is_file(); "
                 "print(session_search.__file__)"
             ),
         ],

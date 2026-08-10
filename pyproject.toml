@@ -38,6 +38,7 @@ Repository = "https://github.com/tjp2021/session-search"
 Issues = "https://github.com/tjp2021/session-search/issues"
 
 [tool.setuptools]
+packages = ["evals"]
 py-modules = [
   "adapter_capabilities",
   "archive_intent",
@@ -58,6 +59,9 @@ py-modules = [
   "ss_packets",
   "ss_retrieval",
 ]
+
+[tool.setuptools.package-data]
+evals = ["*.json", "*.md"]
 
 [tool.setuptools.data-files]
 "share/session-search/evals" = [

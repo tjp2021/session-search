@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import re
@@ -5,6 +6,7 @@ import tempfile
 import tomllib
 import unittest
 from contextlib import redirect_stdout
+from contextlib import redirect_stderr
 from io import StringIO
 from unittest import mock
 
@@ -23,6 +25,17 @@ class PortableConfigurationTest(unittest.TestCase):
         self.assertEqual(payload["project"]["scripts"]["ss"], "session_search:main")
         self.assertEqual(payload["project"]["requires-python"], ">=3.11")
         self.assertIn("wcwidth>=0.2,<1", payload["project"]["dependencies"])
+        self.assertIn("evals", payload["tool"]["setuptools"]["packages"])
+        self.assertIn("*.json", payload["tool"]["setuptools"]["package-data"]["evals"])
+
+    def test_default_eval_corpus_is_public_and_sanitized(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        default = root / "evals" / "session-search-evals.json"
+        payload = json.loads(default.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(len(payload["cases"]), 3)
+        text = default.read_text(encoding="utf-8").lower()
+        self.assertIn("starter cases", text)
+        self.assertNotIn("/users/", text)
 
     def test_readme_documents_the_unpinned_design_partner_install(self):
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -83,6 +96,28 @@ class PortableConfigurationTest(unittest.TestCase):
         )
         self.assertEqual(paths.db, paths.data_dir / "session-search.sqlite")
         self.assertEqual(paths.model_cache, paths.data_dir / "models")
+
+    def test_linux_defaults_use_xdg_data_home(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            ss_config.sys, "platform", "linux"
+        ):
+            home = pathlib.Path(tmpdir)
+            paths = ss_config.resolve_paths(
+                home=home, environ={"XDG_DATA_HOME": str(home / "xdg-data")}
+            )
+        self.assertEqual(paths.data_dir, home / "xdg-data" / "session-search")
+
+    def test_malformed_config_has_a_bounded_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = pathlib.Path(tmpdir)
+            config = home / ".config" / "session-search" / "config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text("[storage\ndata_dir = broken", encoding="utf-8")
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                ss_config.resolve_paths(home=home, environ={})
+        self.assertIn("ignored invalid config", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_environment_data_directory_overrides_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -152,6 +187,17 @@ class AdapterCapabilityTest(unittest.TestCase):
         # Real leak shapes, not a sentinel string that appears nowhere else.
         for private in ("/Users/", "/home/", str(pathlib.Path.home()), "YN" + "G"):
             self.assertNotIn(private, rendered)
+
+    def test_capabilities_stack_within_a_narrow_terminal(self):
+        with mock.patch.object(
+            adapter_capabilities.shutil,
+            "get_terminal_size",
+            return_value=os.terminal_size((40, 24)),
+        ):
+            rendered = adapter_capabilities.render_capabilities()
+        self.assertIn("Claude Code", rendered)
+        self.assertIn("Native reopen", rendered)
+        self.assertTrue(all(len(line) <= 40 for line in rendered.splitlines()))
 
     def test_cli_capabilities_command_uses_capability_matrix(self):
         stdout = StringIO()

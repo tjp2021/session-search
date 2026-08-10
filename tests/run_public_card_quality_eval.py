@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import pathlib
 import sys
@@ -14,9 +16,12 @@ from card_quality import quality_gate
 
 
 def main() -> int:
-    corpus = json.loads(
-        (ROOT / "evals" / "public-card-quality-corpus.json").read_text(encoding="utf-8")
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected", type=pathlib.Path)
+    args = parser.parse_args()
+    corpus_path = ROOT / "evals" / "public-card-quality-corpus.json"
+    corpus_bytes = corpus_path.read_bytes()
+    corpus = json.loads(corpus_bytes)
     failures: list[dict[str, object]] = []
     for case in corpus["cases"]:
         actual = list(quality_gate(*case["input"]).__dict__.values())
@@ -30,9 +35,24 @@ def main() -> int:
         "passed": len(corpus["cases"]) - len(failures),
         "failed": len(failures),
         "failures": failures,
+        "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
     }
     print(json.dumps(result, indent=2))
-    return 1 if failures else 0
+    if failures:
+        return 1
+    if args.expected:
+        expected = json.loads(args.expected.read_text(encoding="utf-8"))
+        comparable = {
+            "corpus_version": result["version"],
+            "cases": result["cases"],
+            "passed": result["passed"],
+            "failed": result["failed"],
+            "corpus_sha256": result["corpus_sha256"],
+        }
+        if comparable != {key: expected.get(key) for key in comparable}:
+            print("card-quality evidence mismatch", file=sys.stderr)
+            return 2
+    return 0
 
 
 if __name__ == "__main__":

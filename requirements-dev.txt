@@ -1,1 +1,3 @@
+-r requirements.txt
 coverage>=7,<8
+pexpect>=4.9,<5

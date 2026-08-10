@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
-import shutil
 import sqlite3
 import sys
+import uuid
 from typing import Any
 from archive_intent import PARSER_VERSION as ARCHIVE_INTENT_VERSION
 from archive_store import StorageFailure, immediate_transaction, quick_check
@@ -88,6 +89,8 @@ def cmd_project(args: argparse.Namespace) -> int:
                 ss.PROJECT_PAGE_MAX,
                 max(1, int(getattr(args, "limit", ss.PROJECT_PAGE_MAX))),
             )
+            if ss.dashboard_is_interactive():
+                requested_limit = max(1, (ss.dashboard_terminal_height() - 14) // 9)
             page = max(1, int(getattr(args, "page", 1)))
             offset = (page - 1) * requested_limit
             canonical_name, results, total = ss.dashboard_project_results(
@@ -228,15 +231,8 @@ def quarantine_damaged_index(db_path: pathlib.Path) -> pathlib.Path | None:
         raise
     except (sqlite3.DatabaseError, StorageFailure):
         damaged = db_path.with_name(db_path.name + ".damaged")
-        # A stale quarantine slot must never block recovery, even when a
-        # previous run left a directory or a special file at that name.
-        if damaged.is_dir() and not damaged.is_symlink():
-            shutil.rmtree(damaged, ignore_errors=True)
-        else:
-            try:
-                damaged.unlink(missing_ok=True)
-            except OSError:
-                pass
+        if damaged.exists() or damaged.is_symlink():
+            damaged = db_path.with_name(f"{db_path.name}.damaged.{uuid.uuid4().hex}")
         db_path.replace(damaged)
         for suffix in ("-wal", "-shm", "-journal"):
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
@@ -259,7 +255,11 @@ def cmd_index(args: argparse.Namespace) -> int:
             else:
                 ss.init_db(conn)
             sources = ss.normalize_sources(args.source)
-            count = ss.upsert_documents(conn, ss.build_docs(home, sources))
+            count = ss.upsert_documents(
+                conn,
+                ss.build_docs(home, sources),
+                reconcile_sources=sources,
+            )
             ss.sync_detected_archive_states(conn)
             if not args.quiet:
                 print(f"Indexed {count} documents into {db_path}")
@@ -466,20 +466,31 @@ def cmd_handoff(args: argparse.Namespace) -> int:
                 return 0
 
             packet_path = ss.handoff_path(row, target)
-            packet_path.parent.mkdir(parents=True, exist_ok=True)
+            packet_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            packet_path.parent.chmod((packet_path.parent.stat().st_mode & 0o777) & 0o700)
             card = ss.session_card_for_result(conn, row, query)
-            packet_path.write_text(
-                ss.handoff_packet_text(
-                    row,
-                    target,
-                    query,
-                    args.selector,
-                    packet_rows,
-                    card,
-                    archived=ss.session_is_archived(conn, str(row["source"]), str(row["session_id"])),
-                ),
-                encoding="utf-8",
+            packet_text = ss.handoff_packet_text(
+                row,
+                target,
+                query,
+                args.selector,
+                packet_rows,
+                card,
+                archived=ss.session_is_archived(conn, str(row["source"]), str(row["session_id"])),
             )
+            packet_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            packet_flags |= getattr(os, "O_NOFOLLOW", 0)
+            packet_fd = os.open(packet_path, packet_flags, 0o600)
+            try:
+                with os.fdopen(packet_fd, "w", encoding="utf-8") as packet_file:
+                    packet_file.write(packet_text)
+            except BaseException:
+                try:
+                    os.close(packet_fd)
+                except OSError:
+                    pass
+                raise
+            packet_path.chmod((packet_path.stat().st_mode & 0o777) & 0o600)
 
             print(f"Context packet: {packet_path}")
             print(f"Original owner: {ss.source_label(row['source'])}")
@@ -499,8 +510,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     with ss.session_lock(shared=True):
         db_path = ss.expand(args.db)
         if not db_path.exists():
-            print(f"Index not found: {db_path}")
-            return 0
+            print(f"Index not found: {db_path}", file=sys.stderr)
+            return 2
         conn = ss.connect_db(db_path)
         try:
             ss.init_db(conn)
@@ -833,6 +844,7 @@ def cmd_natural(args: argparse.Namespace) -> int:
         query_parts = query_parts[1:]
     query = " ".join(query_parts).strip()
     db_path = ss.expand(args.db)
+    indexed = False
     if not args.no_refresh and (force_refresh or not db_path.exists()):
         ss.cmd_index(
             argparse.Namespace(
@@ -843,6 +855,7 @@ def cmd_natural(args: argparse.Namespace) -> int:
                 quiet=not force_refresh,
             )
         )
+        indexed = True
     if not query:
         return ss.cmd_dashboard(args)
     return ss.cmd_search(
@@ -853,7 +866,7 @@ def cmd_natural(args: argparse.Namespace) -> int:
             source=args.source,
             mode=args.mode,
             home=args.home,
-            no_refresh=args.no_refresh,
+            no_refresh=args.no_refresh or indexed,
         )
     )
 

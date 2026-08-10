@@ -4,5 +4,6 @@
   "cases": 30,
   "passed": 30,
   "failed": 0,
+  "corpus_sha256": "739cb32afcf3cb9ededa1bf7bd7e4c19a6d33470893d28ff80b2d4278635cd66",
   "method": "Frozen synthetic inputs evaluated by tests/run_public_card_quality_eval.py"
 }

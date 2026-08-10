@@ -105,6 +105,15 @@ def dashboard_terminal_width() -> int:
     return max(32, min(width, 200))
 
 
+def dashboard_terminal_height() -> int:
+    """Return a bounded row count for interactive dashboard layout."""
+    try:
+        height = int(shutil.get_terminal_size(fallback=(100, 24)).lines)
+    except (TypeError, ValueError, OSError):
+        height = 24
+    return max(12, min(height, 200))
+
+
 def dashboard_clean_text(value: str) -> str:
     """Strip control junk that makes terminal paste unreadable.
 
@@ -875,6 +884,9 @@ def print_dashboard(
 ) -> list[dict[str, Any]]:
     """Restart recovery screen: sparse, grouped, scannable."""
     width = ss.dashboard_terminal_width()
+    interactive = ss.dashboard_is_interactive()
+    height = dashboard_terminal_height() if interactive else 0
+    all_results = results
     title = heading or ("SS archived" if archived_view else "SS")
     print(title)
     if not results:
@@ -911,6 +923,14 @@ def print_dashboard(
             }
         )
 
+    all_thread_entries = thread_entries
+    if interactive:
+        # Keep the newest work, navigation choices, and input prompt in one
+        # viewport. Project selectors still derive from the complete result
+        # set, so changing terminal height never changes what P1 or P2 means.
+        visible_limit = max(1, (height - 14) // 9)
+        thread_entries = thread_entries[:visible_limit]
+
     # Group the visible threads under projects. This is the main scan surface.
     groups: list[tuple[str, list[dict[str, Any]]]] = []
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -928,11 +948,14 @@ def print_dashboard(
         project_summaries = ss.dashboard_project_summaries(
             conn,
             source_name="all",
-            thread_limit=len(results),
+            thread_limit=len(all_results),
         )
 
     # Quiet "more projects" footer: only projects not already on screen.
-    visible_projects = {name.removesuffix(" [ARCHIVED]") for name, _items in groups}
+    visible_projects = {
+        str(entry["project"]).removesuffix(" [ARCHIVED]")
+        for entry in all_thread_entries
+    }
     more_projects: list[dict[str, Any]] = []
     if project_summaries:
         for item in project_summaries:
@@ -942,9 +965,14 @@ def print_dashboard(
             if ss.dashboard_project_is_noise(name, str(item.get("repo") or "")):
                 continue
             more_projects.append(item)
-        more_projects = more_projects[:8]
+        project_limit = 8
+        if interactive:
+            project_limit = 3
+        more_projects = more_projects[:project_limit]
 
-    total = len(thread_entries) if total_threads is None else max(len(thread_entries), int(total_threads))
+    total = len(all_thread_entries) if total_threads is None else max(
+        len(all_thread_entries), int(total_threads)
+    )
     if total > len(thread_entries) or page_offset:
         first = page_offset + 1
         last = page_offset + len(thread_entries)
@@ -953,7 +981,8 @@ def print_dashboard(
         count_line = f"{len(thread_entries)} recent thread{'s' if len(thread_entries) != 1 else ''} · open with: ss open N"
     for line in dashboard_wrapped_lines(count_line, width):
         print(line)
-    print()
+    if not interactive:
+        print()
 
     card_width = min(width, 112)
     for project_name, items in groups:
@@ -963,7 +992,9 @@ def print_dashboard(
             print(line)
         # Keep one short folder line only when it adds information.
         folder = ss.repo_label(latest["repo"])
-        if folder and folder not in {"unknown", "unknown from index"}:
+        if folder and folder not in {"unknown", "unknown from index"} and not (
+            interactive and width < 52
+        ):
             for line in dashboard_wrapped_lines(folder, max(1, width - 2)):
                 print(f"  {line}")
         for entry in items:
@@ -981,6 +1012,12 @@ def print_dashboard(
             if entry["clue"] and not entry["clue"].lower().startswith("key terms:"):
                 fields.append(("Clue:", entry["clue"]))
             fields.append(("Open:", f"ss open {entry['rank']}"))
+            if interactive:
+                compact_width = max(8, card_width - (6 if card_width < 52 else 20))
+                fields = [
+                    (label, ss.dashboard_cell(value, compact_width))
+                    for label, value in fields
+                ]
             title_line = f"{entry['rank']} · {tool}{marker} · {entry['when']}"
             for line in dashboard_restart_card_lines(title_line, fields, card_width):
                 print(line)
@@ -990,11 +1027,14 @@ def print_dashboard(
         print("Older projects still saved:")
         for project_rank, item in enumerate(more_projects, 1):
             when = ss.dashboard_relative_time(item.get("latest_ts"))
-            summary = (
-                f"P{project_rank} · {item['project']} · {when} · "
-                f"{item.get('count', 0)} threads · "
-                f"{item.get('latest_about') or 'No summary available.'}"
-            )
+            if interactive:
+                summary = f"P{project_rank} · {item['project']}"
+            else:
+                summary = (
+                    f"P{project_rank} · {item['project']} · {when} · "
+                    f"{item.get('count', 0)} threads · "
+                    f"{item.get('latest_about') or 'No summary available.'}"
+                )
             for line in dashboard_wrapped_lines(summary, max(1, width - 2)):
                 print(f"  {line}")
         for line in dashboard_wrapped_lines(
@@ -1002,13 +1042,15 @@ def print_dashboard(
             max(1, width - 2),
         ):
             print(f"  {line}")
-        print()
+        if not interactive:
+            print()
 
-    for line in dashboard_wrapped_lines(
-        "ss <search> · ss open N · ss look at N · ss archive N · ss archived",
-        width,
-    ):
-        print(line)
+    if not interactive:
+        for line in dashboard_wrapped_lines(
+            "ss <search> · ss open N · ss look at N · ss archive N · ss archived",
+            width,
+        ):
+            print(line)
     return more_projects
 
 

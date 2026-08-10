@@ -637,7 +637,7 @@ def main() -> int:
         )
         require(transcript, "Older projects still saved:", "older-project discovery")
         require(transcript, "SS project · Shared / Osmo", "older-project selection")
-        require(transcript, "201-205 shown of 205 threads", "older-project final page")
+        require(transcript, "2-2 shown of 205 threads", "older-project next page")
         require(transcript, "Project selector not found", "mistake recovery")
 
         # Ctrl-C must stop cleanly without a traceback.

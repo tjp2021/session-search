@@ -4,6 +4,7 @@
 .gitignore
 LICENSE
 README.md
+CHANGELOG.md
 adapter_capabilities.py
 archive_intent.py
 archive_store.py
@@ -13,12 +14,16 @@ demo_runner.py
 docs/architecture.md
 docs/case-study.md
 docs/unguided-usability-test.md
+evals/__init__.py
 evals/archive-intent-corpus.json
 evals/public-card-quality-corpus.json
 evals/public-retrieval-corpus.json
+evals/sealed-holdout-protocol.md
+evals/session-search-evals.json
 evidence/public-benchmark-v0.1.0.json
 evidence/public-card-quality-v0.1.0.json
 evidence/public-retrieval-v0.1.0.json
+evidence/public-sealed-holdout-v0.2.2.json
 platform_lock.py
 public-files.txt
 public_corpus.py
@@ -43,9 +48,11 @@ uv.lock
 tests/benchmark_archive.py
 tests/benchmark_public.py
 tests/run_dashboard_latency_gate.py
+tests/run_human_usability_gate.py
 tests/run_installed_acceptance.py
 tests/run_public_card_quality_eval.py
 tests/run_public_retrieval_eval.py
+tests/run_sealed_holdout.py
 tests/run_task_usability_acceptance.py
 tests/run_upgrade_acceptance.py
 tests/test_adapter_pipeline.py
@@ -59,6 +66,7 @@ tests/test_fault_reliability.py
 tests/test_natural_parser.py
 tests/test_productization.py
 tests/test_public_card_quality.py
+tests/test_release_evidence.py
 tests/test_readme_accuracy.py
 tests/test_retrieval_metrics.py
 tests/test_secret_redaction.py

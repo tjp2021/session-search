@@ -123,6 +123,47 @@ class DashboardWorkMapContracts(unittest.TestCase):
         self.assertIn("Open: ss open 3", text)
         self.assertNotIn("Open: ss open 4", text)
 
+    def test_interactive_dashboard_keeps_navigation_in_one_short_viewport(self) -> None:
+        for index in range(10):
+            _seed_session(
+                self.conn,
+                source="codex",
+                session_id=f"short-{index}",
+                cwd=f"/Users/alex/workspace/project-{index}",
+                title=f"Task {index}",
+                about=f"Review task {index}",
+                state=f"Completed task {index}",
+                resume=f"Continue task {index}",
+                ts=1_700_000_000 + index,
+            )
+        results = ss.recent_session_results(self.conn, 10, "all")
+        older = [
+            {
+                "project": f"Saved project {index}",
+                "repo": f"/tmp/saved-{index}",
+                "latest_ts": 100 - index,
+                "count": 1,
+                "latest_about": f"Saved work {index}",
+            }
+            for index in range(8)
+        ]
+        out = io.StringIO()
+        for width in (40, 80):
+            with self.subTest(width=width):
+                out = io.StringIO()
+                with (
+                    mock.patch.object(ss, "dashboard_is_interactive", return_value=True),
+                    mock.patch.object(ss, "dashboard_terminal_width", return_value=width),
+                    mock.patch.object(dashboard, "dashboard_terminal_height", return_value=24),
+                    contextlib.redirect_stdout(out),
+                ):
+                    choices = ss.print_dashboard(self.conn, results, project_summaries=older)
+                lines = out.getvalue().splitlines()
+                self.assertLessEqual(len(lines) + 1, 24)
+                self.assertEqual(lines[0], "SS")
+                self.assertIn("Older projects still saved:", out.getvalue())
+                self.assertLessEqual(len(choices), 3)
+
     def test_dashboard_keeps_about_state_resume_on_threads(self) -> None:
         _seed_session(
             self.conn,

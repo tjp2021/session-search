@@ -10,12 +10,24 @@ from __future__ import annotations
 import dataclasses
 import glob
 import json
+import os
 import pathlib
 import sqlite3
 import urllib.parse
 from typing import Any, Iterator
 
 import session_search as ss
+
+
+def _vscode_user_roots(home: pathlib.Path, source: str) -> list[pathlib.Path]:
+    """Return macOS and XDG editor roots in deterministic order."""
+    app = "Code" if source == "vscode" else "Cursor"
+    roots = [home / "Library" / "Application Support" / app / "User"]
+    xdg = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    roots.append(xdg / app / "User")
+    if source == "vscode":
+        roots.append(xdg / "Code - OSS" / "User")
+    return list(dict.fromkeys(roots))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,12 +61,14 @@ def _adapter_candidates(home: pathlib.Path, source: str) -> list[pathlib.Path]:
     if source == "pi":
         return list(home.glob(".pi/agent/sessions/**/*.jsonl"))
     if source in {"vscode", "cursor"}:
-        app = "Code" if source == "vscode" else "Cursor"
-        root = home / "Library" / "Application Support" / app / "User"
         return [
-            *root.glob("globalStorage/emptyWindowChatSessions/*.jsonl"),
-            *root.glob("globalStorage/state.vscdb"),
-            *root.glob("workspaceStorage/*/state.vscdb"),
+            path
+            for root in _vscode_user_roots(home, source)
+            for path in (
+                *root.glob("globalStorage/emptyWindowChatSessions/*.jsonl"),
+                *root.glob("globalStorage/state.vscdb"),
+                *root.glob("workspaceStorage/*/state.vscdb"),
+            )
         ]
     return []
 
@@ -576,13 +590,13 @@ def extract_content_text(content: Any) -> str:
 
 
 def iter_vscode(home: pathlib.Path) -> Iterator[Document]:
-    code_root = home / "Library" / "Application Support" / "Code" / "User"
-    yield from ss.iter_vscode_user_root(code_root, source="vscode")
+    for root in _vscode_user_roots(home, "vscode"):
+        yield from ss.iter_vscode_user_root(root, source="vscode")
 
 
 def iter_cursor(home: pathlib.Path) -> Iterator[Document]:
-    cursor_root = home / "Library" / "Application Support" / "Cursor" / "User"
-    yield from ss.iter_vscode_user_root(cursor_root, source="cursor")
+    for root in _vscode_user_roots(home, "cursor"):
+        yield from ss.iter_vscode_user_root(root, source="cursor")
 
 
 def iter_vscode_user_root(root: pathlib.Path, source: str) -> Iterator[Document]:

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "description": "Public starter cases for local ranking checks. Replace or extend them with terms from your own index.",
+  "cases": [
+    {
+      "name": "Robot battery recovery",
+      "query": "robot battery connector",
+      "expected_within": 5,
+      "accept": [{"contains_all": ["robot", "battery"]}]
+    },
+    {
+      "name": "Payment replay protection",
+      "query": "payment replay protection",
+      "expected_within": 5,
+      "accept": [{"contains_all": ["payment", "replay"]}]
+    },
+    {
+      "name": "Editor sign-in recovery",
+      "query": "coding assistant signed in",
+      "expected_within": 5,
+      "accept": [{"contains_any": ["copilot", "signed in", "authentication"]}]
+    }
+  ]
+}

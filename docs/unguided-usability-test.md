@@ -1,12 +1,12 @@
 # SS task-based usability pilot
 
-This pilot supplies observed human evidence. Automated acceptance cannot prove that unfamiliar people understand SS.
+This pilot supplies observed human evidence. Automated acceptance can't prove that unfamiliar people understand SS.
 
 ## Participants
 
 Recruit five developers who use at least one AI coding tool. They must not have seen the SS implementation or demo.
 
-Use a fresh macOS or Linux account with Python 3.11 or newer, `pipx`, Git, and network access. Give each participant only the public repository URL and the tasks below. Do not coach them.
+Use a fresh macOS or Linux account with Python 3.11 or newer, `pipx`, Git, and network access. Give each participant only the public repository URL and the tasks below. Don't coach them.
 
 ## Setup
 
@@ -61,10 +61,12 @@ Record only synthetic content and these fields for each participant and task:
 | Error category | discovery, wording, selector, rendering, installation, or recovery |
 | Help requested | none or sanitized description |
 | Expected command effect | participant's short explanation |
+| Unintended archive change | true or false |
+| Unsafe access | true or false |
 
 Ask what `open`, `look at`, `continue`, and `archive` mean before the participant runs those commands.
 
-Do not record names, real home paths, private sessions, terminal history, tokens, screen recordings, or raw transcripts.
+Don't record names, real home paths, private sessions, terminal history, tokens, screen recordings, or raw transcripts.
 
 ## Acceptance
 
@@ -75,3 +77,11 @@ Do not record names, real home paths, private sessions, terminal history, tokens
 - Any repeated failure must become an automated regression case before release.
 
 A blocking installation, privacy, selector, or recovery failure reopens the release plan. Record smaller problems as ranked follow-up issues.
+
+Store only the sanitized fields above in a JSON `records` list. Run the manual release gate after all five pilots:
+
+```bash
+.venv/bin/python tests/run_human_usability_gate.py --results <sanitized-results.json>
+```
+
+CI can't replace this pilot. Don't mark the public release ready until this command passes with real participant results.

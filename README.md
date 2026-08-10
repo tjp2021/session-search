@@ -22,17 +22,20 @@ ss what was I doing with the robots battery pricing
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Session Search is built for Mac developers who use Claude Code and Codex
-across many repositories. It also reads Pi sessions. VS Code/Copilot and
-Cursor support is partial, and exact native reopening is not available for
+Session Search is built for developers on macOS and Linux who use Claude Code
+and Codex across many repositories. It also reads Pi sessions. VS Code/Copilot
+and Cursor support is partial, and exact native reopening is not available for
 those two sources.
 
 The proof is public: the [case study](docs/case-study.md),
 [retrieval benchmark](#published-evidence),
 [privacy tests](tests/test_secret_redaction.py), and
 [current CI results](../../actions) ship with the repository.
+See the [changelog](CHANGELOG.md) for release details.
 
 Indexing, search, ranking, and evidence-based session cards run on macOS and Linux.
+Linux discovery follows `XDG_CONFIG_HOME` for VS Code and Cursor stores. SS data
+follows `XDG_DATA_HOME`, with `~/.local/share` as the fallback.
 Optional model summaries send selected session text to OpenRouter only after
 you turn on two settings. See
 [What leaves your machine](#what-leaves-your-machine).
@@ -70,7 +73,7 @@ ss doctor
 behavior, and removes the data when finished.
 
 `ss doctor` reports whether each local adapter found a store and parsed
-documents. It does not print store paths or session text. Use
+documents. It doesn't print store paths or session text. Use
 `ss doctor --strict` when a candidate store that yields no documents should
 fail an automated check.
 
@@ -103,6 +106,9 @@ result number.
 
 Run `ss` without search words when you want the most recent active sessions
 instead.
+
+The dashboard adapts to the terminal height, so its prompt and choices stay
+visible.
 
 Inside the interactive dashboard, you can also:
 
@@ -207,10 +213,11 @@ Claude Code and Codex can't natively reopen each other's sessions. SS instead
 creates a local context packet and prints the command needed to start the
 target tool in the correct folder.
 
-Context packets are stored under:
+Context packets are stored under the SS data directory:
 
 ```text
-~/Library/Application Support/session-search/context-packets/
+macOS: ~/Library/Application Support/session-search/context-packets/
+Linux: ${XDG_DATA_HOME:-~/.local/share}/session-search/context-packets/
 ```
 
 VS Code/Copilot and Cursor sessions remain searchable. Exact native reopening
@@ -303,10 +310,11 @@ SS reads local session records from:
 - VS Code/Copilot empty-window chat JSONL and selected state entries.
 - Selected Cursor chat state entries.
 
-It writes a private SQLite index to:
+It writes a private SQLite index to the platform data directory:
 
 ```text
-~/Library/Application Support/session-search/session-search.sqlite
+macOS: ~/Library/Application Support/session-search/session-search.sqlite
+Linux: ${XDG_DATA_HOME:-~/.local/share}/session-search/session-search.sqlite
 ```
 
 The default hybrid search combines:
@@ -317,10 +325,11 @@ The default hybrid search combines:
 - Local per-turn embeddings for relevant details buried inside long sessions.
 
 The semantic model is `BAAI/bge-small-en-v1.5`, loaded locally through
-FastEmbed and cached under:
+FastEmbed and cached under the same platform data directory:
 
 ```text
-~/Library/Application Support/session-search/models/
+macOS: ~/Library/Application Support/session-search/models/
+Linux: ${XDG_DATA_HOME:-~/.local/share}/session-search/models/
 ```
 
 Run this after a large refresh when you want to build any missing
@@ -332,7 +341,7 @@ ss embed
 
 ## What leaves your machine
 
-No session content leaves your Mac by default. Session cards use local
+No session content leaves your computer by default. Session cards use local
 evidence. FastEmbed can download its model during the first semantic search,
 but it doesn't upload your session text.
 
@@ -421,6 +430,17 @@ ss unarchive N
 ss status
 ```
 
+`ss status` returns a nonzero result when the index is missing or unhealthy.
+
+### Rebuild damaged or stale SS state
+
+```bash
+ss index --reset
+```
+
+This command removes only the derived SS index. It never changes native session
+archives.
+
 ## Current limitations
 
 - Codex user prompts and thread metadata are reliable, but complete assistant
@@ -461,7 +481,8 @@ The versioned source data is in `evidence/`. Run it again with:
 
 ```bash
 .venv/bin/python tests/run_public_retrieval_eval.py --mode all
-.venv/bin/python tests/benchmark_public.py --sessions 100 1000 --semantic
+.venv/bin/python tests/benchmark_public.py --sessions 100 1000 --semantic \
+  --expected evidence/public-benchmark-v0.1.0.json
 ```
 
 See `docs/case-study.md` for the engineering narrative and
@@ -503,9 +524,10 @@ Run ranking evaluations:
 .venv/bin/python tests/run_dashboard_latency_gate.py
 ```
 
-`session_search.py eval` also exists, but its default case file does not ship
-with the repository. It scores your own local sessions, so it reports every
-case as failed on a fresh clone. Point it at your own file to use it:
+`session_search.py eval` also exists. Its installed starter file contains public
+example cases. It scores your own local index, so those examples can fail when
+your history doesn't contain matching work. Replace or extend the starter cases
+when you use this command as a personal regression suite:
 
 ```bash
 .venv/bin/python session_search.py eval --mode fts --file <your-cases.json>
@@ -523,9 +545,16 @@ Inspect internal counts:
 .venv/bin/python session_search.py status
 ```
 
-The archive-intent regression corpus is
-`evals/archive-intent-corpus.json`. Independent holdouts stay outside Git and
-are evaluated by recorded SHA-256 digest and aggregate results.
+The archive-intent regression corpus is `evals/archive-intent-corpus.json`.
+Independent holdout text stays outside Git. The public
+[protocol](evals/sealed-holdout-protocol.md),
+[evaluator](tests/run_sealed_holdout.py), and
+[aggregate proof](evidence/public-sealed-holdout-v0.2.2.json) record the digest,
+the failed predecessor, and the final aggregate results.
+
+The five-person usability pilot remains a manual release prerequisite. The
+[pilot protocol](docs/unguided-usability-test.md) includes an executable gate.
+No automated test can replace observed results from unfamiliar users.
 
 ## Open product work
 

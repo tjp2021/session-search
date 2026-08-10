@@ -70,6 +70,9 @@ SAMPLES[0].extend(
         "Api_Key=" + "MixedCaseValue1234567890",
         "aws_secret_access_key=" + "A" * 40,
         'password = "correct horse battery staple"',
+        "AWS_SESSION_TOKEN=" + "A" * 32 + "+/==",
+        "AccountKey=" + "B" * 32 + "+/==",
+        "npm_" + "c" * 36,
     ]
 )
 

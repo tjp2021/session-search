@@ -113,6 +113,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sessions", type=int, nargs="+", default=[100, 1000])
     parser.add_argument("--semantic", action="store_true")
+    parser.add_argument("--expected", type=pathlib.Path)
+    parser.add_argument("--max-regression-factor", type=float, default=6.0)
     args = parser.parse_args()
     report = {
         "schema_version": 1,
@@ -123,6 +125,42 @@ def main() -> int:
         "runs": [run(count, args.semantic) for count in args.sessions],
     }
     print(json.dumps(report, indent=2, sort_keys=True))
+    if args.expected:
+        expected = json.loads(args.expected.read_text(encoding="utf-8"))
+        expected_runs = {int(run["sessions"]): run for run in expected["runs"]}
+        failures: list[str] = []
+        for measured_run in report["runs"]:
+            baseline = expected_runs.get(int(measured_run["sessions"]))
+            if baseline is None:
+                failures.append(
+                    f"no evidence baseline for {measured_run['sessions']} sessions"
+                )
+                continue
+            for mode, timings in measured_run["queries"].items():
+                if mode not in baseline["queries"]:
+                    failures.append(
+                        f"no {mode} evidence for {measured_run['sessions']} sessions"
+                    )
+                    continue
+                for metric in ("p50_ms", "p95_ms"):
+                    limit = max(
+                        50.0,
+                        float(baseline["queries"][mode][metric])
+                        * args.max_regression_factor,
+                    )
+                    if float(timings[metric]) > limit:
+                        failures.append(
+                            f"{measured_run['sessions']} {mode} {metric}={timings[metric]} exceeds {limit:.3f}"
+                        )
+            if args.semantic and float(measured_run["embedding_ms"]) > 30000:
+                failures.append(
+                    f"{measured_run['sessions']} embedding_ms={measured_run['embedding_ms']} exceeds 30000"
+                )
+        if failures:
+            print("Performance evidence gate failed:", file=sys.stderr)
+            for failure in failures:
+                print(f"- {failure}", file=sys.stderr)
+            return 1
     return 0
 
 

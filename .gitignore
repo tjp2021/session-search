@@ -5,3 +5,8 @@ __pycache__/
 build/
 .coverage
 *.egg-info/
+
+# Local demo renders and capture output
+demo-recording/*.mp4
+demo-recording/*.png
+demo-recording/*.log

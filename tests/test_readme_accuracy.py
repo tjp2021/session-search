@@ -96,22 +96,15 @@ class ReadmeCommandTest(unittest.TestCase):
                     missing.append((candidate, line))
         self.assertFalse(missing, f"README names paths that do not ship: {missing}")
 
-    def test_default_eval_file_claim_is_honest(self):
-        """`session_search.py eval` needs a file that does not ship publicly.
-
-        If the shipped default ever becomes public, relax this test. Until then
-        the README must not present the bare command as runnable from a clone.
-        """
+    def test_default_eval_file_ships_with_the_public_repository(self):
+        """The installed default must not point at a private-only fixture."""
         default = pathlib.Path(str(ss.DEFAULT_EVALS))
-        if (ROOT / default.name).exists() or (ROOT / "evals" / default.name).exists():
-            return
-        text = readme_text()
-        self.assertRegex(
-            text,
-            r"eval[\s\S]{0,400}?(does not ship|not shipped|private|your own)",
-            "README shows `session_search.py eval` but never says its default "
-            "case file does not ship with the repository",
+        shipped = ROOT / "evals" / default.name
+        self.assertTrue(
+            shipped.is_file(),
+            f"default eval file does not ship: {shipped}",
         )
+        self.assertIn("evals/session-search-evals.json", (ROOT / "public-files.txt").read_text())
 
 
 class ReadmeNumberTest(unittest.TestCase):

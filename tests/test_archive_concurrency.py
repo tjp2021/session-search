@@ -2,6 +2,8 @@ import multiprocessing
 import pathlib
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 
 import session_search as ss
@@ -37,6 +39,42 @@ def transition_worker(db_path: str, lock_path: str, worker: int, errors) -> None
 
 
 class ArchiveConcurrencyTest(unittest.TestCase):
+    def test_threads_cannot_bypass_the_reentrant_process_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            old_lock = ss.DEFAULT_LOCK
+            ss.DEFAULT_LOCK = str(pathlib.Path(temp) / "sessions.lock")
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            second_entered = threading.Event()
+
+            def first() -> None:
+                with ss.session_lock(shared=False):
+                    first_entered.set()
+                    release_first.wait(2)
+
+            def second() -> None:
+                first_entered.wait(2)
+                with ss.session_lock(shared=False):
+                    second_entered.set()
+
+            first_thread = threading.Thread(target=first)
+            second_thread = threading.Thread(target=second)
+            try:
+                first_thread.start()
+                second_thread.start()
+                self.assertTrue(first_entered.wait(1))
+                time.sleep(0.05)
+                self.assertFalse(second_entered.is_set())
+                release_first.set()
+                first_thread.join(2)
+                second_thread.join(2)
+                self.assertTrue(second_entered.is_set())
+            finally:
+                release_first.set()
+                first_thread.join(2)
+                second_thread.join(2)
+                ss.DEFAULT_LOCK = old_lock
+
     def test_eight_writers_complete_without_lock_errors_or_missing_events(self):
         with tempfile.TemporaryDirectory() as temp:
             db_path = pathlib.Path(temp) / "sessions.sqlite"

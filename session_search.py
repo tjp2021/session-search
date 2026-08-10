@@ -26,6 +26,7 @@ import shlex
 import sqlite3
 import sys
 import tempfile
+import threading
 from collections import Counter
 from typing import Any, Iterable, Iterator
 
@@ -437,19 +438,35 @@ def unique_join(parts: Iterable[str], sep: str = "\n\n") -> str:
 
 def connect_db(db_path: pathlib.Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        db_path.parent.chmod((db_path.parent.stat().st_mode & 0o777) & 0o700)
+    except OSError:
+        pass
     conn = sqlite3.connect(db_path)
     try:
+        try:
+            db_path.chmod((db_path.stat().st_mode & 0o777) & 0o600)
+        except OSError:
+            pass
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA busy_timeout = 5000")
-    except sqlite3.Error:
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                try:
+                    sidecar.chmod((sidecar.stat().st_mode & 0o777) & 0o600)
+                except OSError:
+                    pass
+    except (sqlite3.Error, OSError):
         conn.close()
         raise
     return conn
 
 
-_LOCK_DEPTH = 0
+_LOCK_STATE = threading.local()
+_THREAD_LOCK = threading.RLock()
 
 
 @contextlib.contextmanager
@@ -460,20 +477,21 @@ def session_lock(shared: bool = False) -> Iterator[None]:
     when an outer command already holds it. Without it the inner acquire waits
     on a lock this same process owns and fails after the timeout.
     """
-    global _LOCK_DEPTH
-    if _LOCK_DEPTH > 0:
-        _LOCK_DEPTH += 1
-        try:
-            yield
-        finally:
-            _LOCK_DEPTH -= 1
-        return
-    with file_lock(expand(DEFAULT_LOCK), shared=shared):
-        _LOCK_DEPTH += 1
-        try:
-            yield
-        finally:
-            _LOCK_DEPTH -= 1
+    with _THREAD_LOCK:
+        depth = int(getattr(_LOCK_STATE, "depth", 0))
+        if depth > 0:
+            _LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _LOCK_STATE.depth -= 1
+            return
+        with file_lock(expand(DEFAULT_LOCK), shared=shared):
+            _LOCK_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _LOCK_STATE.depth = 0
 
 
 def connect_ro_sqlite(path: pathlib.Path) -> sqlite3.Connection | None:
@@ -636,6 +654,13 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS documents_fts_content;
         DROP TABLE IF EXISTS documents_fts_docsize;
         DROP TABLE IF EXISTS documents_fts_config;
+        DROP TABLE IF EXISTS embeddings;
+        DROP TABLE IF EXISTS session_embeddings;
+        DROP TABLE IF EXISTS session_cards;
+        DROP TABLE IF EXISTS session_archive_status;
+        DROP TABLE IF EXISTS session_archive_events;
+        DROP TABLE IF EXISTS session_archive_meta;
+        DROP TABLE IF EXISTS schema_migrations;
         PRAGMA user_version = 0;
         """
     )
@@ -670,21 +695,43 @@ def chunk_document(doc: Document) -> Iterator[Document]:
         start = max(0, end - CHUNK_OVERLAP)
 
 
-def upsert_documents(conn: sqlite3.Connection, docs: Iterable[Document]) -> int:
+def upsert_documents(
+    conn: sqlite3.Connection,
+    docs: Iterable[Document],
+    *,
+    reconcile_sources: set[str] | None = None,
+) -> int:
     count = 0
     previous_indexed = int(
         conn.execute("SELECT MAX(COALESCE(indexed_at, 0)) FROM documents").fetchone()[0] or 0
     )
     indexed_at = max(now_ts(), previous_indexed + 1)
     with conn:
+        if reconcile_sources:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS scan_seen_documents (doc_id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM scan_seen_documents")
         for source_doc in docs:
+            escaped_id = (
+                source_doc.doc_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            stale_params = (source_doc.doc_id, escaped_id + ":chunk%")
+            conn.execute(
+                "DELETE FROM documents_fts WHERE doc_id = ? OR doc_id LIKE ? ESCAPE '\\'",
+                stale_params,
+            )
+            conn.execute(
+                "DELETE FROM embeddings WHERE doc_id = ? OR doc_id LIKE ? ESCAPE '\\'",
+                stale_params,
+            )
+            conn.execute(
+                "DELETE FROM documents WHERE doc_id = ? OR doc_id LIKE ? ESCAPE '\\'",
+                stale_params,
+            )
             for doc in chunk_document(source_doc):
                 if not useful_text(doc.text):
                     continue
                 text_hash = stable_hash(doc.text, 32)
                 meta_json = json.dumps(doc.meta, sort_keys=True, ensure_ascii=False)
-                conn.execute("DELETE FROM documents_fts WHERE doc_id = ?", (doc.doc_id,))
-                conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc.doc_id,))
                 conn.execute(
                     """
                     INSERT INTO documents (
@@ -715,7 +762,25 @@ def upsert_documents(conn: sqlite3.Connection, docs: Iterable[Document]) -> int:
                     """,
                     (doc.doc_id, doc.title, doc.text, doc.source, doc.cwd),
                 )
+                if reconcile_sources:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO scan_seen_documents (doc_id) VALUES (?)",
+                        (doc.doc_id,),
+                    )
                 count += 1
+        if reconcile_sources:
+            selected = sorted(reconcile_sources)
+            placeholders = ",".join("?" for _ in selected)
+            stale_query = (
+                f"SELECT doc_id FROM documents WHERE source IN ({placeholders}) "
+                "AND doc_id NOT IN (SELECT doc_id FROM scan_seen_documents)"
+            )
+            stale_ids = [str(row[0]) for row in conn.execute(stale_query, selected)]
+            for doc_id in stale_ids:
+                conn.execute("DELETE FROM documents_fts WHERE doc_id = ?", (doc_id,))
+                conn.execute("DELETE FROM embeddings WHERE doc_id = ?", (doc_id,))
+                conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+            conn.execute("DELETE FROM scan_seen_documents")
     return count
 
 
@@ -780,6 +845,7 @@ def _main(argv: list[str] | None = None) -> int:
     # documented form before deciding that the invocation is natural search.
     command_at = 0
     leading_values: dict[str, str] = {}
+    leading_flags: list[str] = []
     while command_at < len(argv):
         token = argv[command_at]
         if token in {"--db", "--home"} and command_at + 1 < len(argv):
@@ -791,8 +857,16 @@ def _main(argv: list[str] | None = None) -> int:
             leading_values[name] = value
             command_at += 1
             continue
+        if token == "--no-refresh":
+            leading_flags.append(token)
+            command_at += 1
+            continue
         break
     explicit_command = argv[command_at] if command_at < len(argv) else ""
+    if explicit_command == "archived" and leading_flags:
+        leading_args = [token for token in argv[:command_at] if token not in leading_flags]
+        argv = [*leading_args, explicit_command, *leading_flags, *argv[command_at + 1 :]]
+        command_at = len(leading_args)
     if argv == ["refresh"]:
         argv = ["index", "--reset", *argv[1:]]
     natural_followup = parse_natural_followup(argv[command_at:])
@@ -891,7 +965,8 @@ from ss_dashboard import (  # noqa: E402
     dashboard_project_is_noise, dashboard_project_label, dashboard_project_results,
     dashboard_project_summaries, dashboard_prompt, dashboard_relative_time,
     dashboard_sentences, dashboard_short_tool,
-    dashboard_summary, dashboard_terminal_width, dashboard_prompt_text, dashboard_topic, evidence_terms,
+    dashboard_summary, dashboard_terminal_height, dashboard_terminal_width, dashboard_prompt_text,
+    dashboard_topic, evidence_terms,
     evidence_terms_from_text, hit_count, iter_dashboard_updates, location_label,
     owner_action_label, print_dashboard, print_dashboard_table, print_results,
     print_session_card_detail, recent_session_results, refresh_dashboard_index,

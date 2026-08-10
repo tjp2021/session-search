@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import pathlib
+import sys
 import tomllib
 from collections.abc import Mapping
 
@@ -28,12 +29,33 @@ def _expanded(path: str | pathlib.Path, home: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(value).expanduser()
 
 
-def _configured_data_dir(home: pathlib.Path) -> pathlib.Path | None:
-    path = home / ".config" / "session-search" / "config.toml"
+def _config_root(home: pathlib.Path, environ: Mapping[str, str]) -> pathlib.Path:
+    value = environ.get("XDG_CONFIG_HOME", "").strip()
+    return _expanded(value, home) if value else home / ".config"
+
+
+def _default_data_dir(home: pathlib.Path, environ: Mapping[str, str]) -> pathlib.Path:
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "session-search"
+    value = environ.get("XDG_DATA_HOME", "").strip()
+    root = _expanded(value, home) if value else home / ".local" / "share"
+    return root / "session-search"
+
+
+def _configured_data_dir(
+    home: pathlib.Path, environ: Mapping[str, str]
+) -> pathlib.Path | None:
+    path = _config_root(home, environ) / "session-search" / "config.toml"
     try:
         with path.open("rb") as handle:
             payload = tomllib.load(handle)
     except FileNotFoundError:
+        return None
+    except tomllib.TOMLDecodeError as exc:
+        print(
+            f"Session Search ignored invalid config at {path}: {exc}",
+            file=sys.stderr,
+        )
         return None
     storage = payload.get("storage", {})
     if not isinstance(storage, dict):
@@ -50,11 +72,11 @@ def resolve_paths(
 ) -> Paths:
     resolved_home = pathlib.Path(home or pathlib.Path.home()).expanduser()
     env = os.environ if environ is None else environ
-    configured = _configured_data_dir(resolved_home)
+    configured = _configured_data_dir(resolved_home, env)
     data_dir = _expanded(
         env.get("SS_DATA_DIR")
         or configured
-        or resolved_home / "Library" / "Application Support" / "session-search",
+        or _default_data_dir(resolved_home, env),
         resolved_home,
     )
     return Paths(

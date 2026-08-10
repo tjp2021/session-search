@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import pathlib
 import sqlite3
 import tempfile
@@ -86,6 +87,35 @@ class NativeCommandContractTest(unittest.TestCase):
 
 
 class AdapterHealthTest(unittest.TestCase):
+    def test_linux_xdg_cursor_store_is_discovered(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": str(pathlib.Path(tmpdir) / "xdg")}
+        ):
+            home = pathlib.Path(tmpdir) / "home"
+            store = pathlib.Path(tmpdir) / "xdg" / "Cursor" / "User" / "globalStorage"
+            store.mkdir(parents=True)
+            db = store / "state.vscdb"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+            conn.execute(
+                "INSERT INTO ItemTable VALUES (?, ?)",
+                (
+                    "workbench.chat.sessions.xdg",
+                    json.dumps(
+                        {
+                            "chatSessions": [
+                                {"text": "Recover the XDG Cursor session from Linux storage."}
+                            ]
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+            conn.close()
+            health = ss.adapter_health(home, {"cursor"})[0]
+        self.assertEqual(health.candidate_stores, 1)
+        self.assertGreater(health.parsed_documents, 0)
+
     def test_health_distinguishes_missing_zero_content_and_parsed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = pathlib.Path(tmpdir)

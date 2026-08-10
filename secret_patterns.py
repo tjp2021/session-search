@@ -103,6 +103,24 @@ PATTERNS: tuple[tuple[int, str, re.Pattern[str], str], ...] = (
         ),
         r"\1[redacted secret]",
     ),
+    (
+        0,
+        "aws-session-token",
+        re.compile(r"\b(AWS_SESSION_TOKEN[\"' ]*[:=][\"' ]*)[a-zA-Z0-9_./+=-]{16,}", re.I),
+        r"\1[redacted token]",
+    ),
+    (
+        0,
+        "azure-account-key",
+        re.compile(r"\b(AccountKey[\"' ]*[:=][\"' ]*)[a-zA-Z0-9+/=]{16,}", re.I),
+        r"\1[redacted secret]",
+    ),
+    (
+        0,
+        "npm-token",
+        re.compile(r"\bnpm_[a-zA-Z0-9]{20,}\b"),
+        "[redacted token]",
+    ),
 )
 
 HOOK_PATTERN_NUMBERS = frozenset(number for number, _, _, _ in PATTERNS if number)

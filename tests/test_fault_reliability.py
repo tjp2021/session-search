@@ -158,6 +158,77 @@ class TransactionFaultTest(unittest.TestCase):
 
 
 class MigrationFaultTest(unittest.TestCase):
+    def test_storage_files_are_private_under_a_public_umask(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / "data"
+            old_umask = os.umask(0o022)
+            try:
+                conn = ss.connect_db(root / "sessions.sqlite")
+                ss.init_db(conn)
+                conn.close()
+                with platform_lock.file_lock(root / "sessions.lock"):
+                    pass
+            finally:
+                os.umask(old_umask)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((root / "sessions.sqlite").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((root / "sessions.lock").stat().st_mode & 0o777, 0o600)
+
+    def test_reindex_removes_old_chunks_but_keeps_unrelated_documents(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ss.init_db(conn)
+        common = dict(
+            source="codex", session_id="s1", title="Title", path="/tmp/source",
+            cwd="/tmp", role="user", ts=1, meta={},
+        )
+        ss.upsert_documents(
+            conn,
+            [
+                ss.Document(doc_id="changing", text="old secret " + "word " * 7000, **common),
+                ss.Document(doc_id="unrelated", text="keep this document", **common),
+            ],
+        )
+        self.assertGreater(
+            conn.execute("SELECT COUNT(*) FROM documents WHERE doc_id LIKE 'changing:chunk%'").fetchone()[0],
+            1,
+        )
+        ss.upsert_documents(
+            conn,
+            [ss.Document(doc_id="changing", text="new short text", **common)],
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM documents WHERE doc_id LIKE 'changing:chunk%'").fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            conn.execute("SELECT text FROM documents WHERE doc_id = 'changing'").fetchone()[0],
+            "new short text",
+        )
+        self.assertEqual(
+            conn.execute("SELECT text FROM documents WHERE doc_id = 'unrelated'").fetchone()[0],
+            "keep this document",
+        )
+        conn.close()
+
+    def test_reset_removes_archive_evidence_and_derived_data(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        ss.init_db(conn)
+        ss.set_session_archive_status(
+            conn, "codex", "s1", True, "manual", evidence="private archive evidence"
+        )
+        conn.execute(
+            "INSERT INTO embeddings VALUES('d1','m',1,?, 'h',1)",
+            (b"1234",),
+        )
+        conn.commit()
+        ss.reset_db(conn)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_archive_status").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session_archive_events").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0], 0)
+        conn.close()
+
     def test_incomplete_statement_is_rejected(self):
         conn = sqlite3.connect(":memory:")
         with self.assertRaises(schema_migrations.MigrationFailure):

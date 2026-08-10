@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-27T17:27:32Z",
+  "dataset_visibility": "private",
+  "passed_dataset_sha256": "8b7b10290c8a5fdeee2fd3a0f348fa247bd3c1fbacd0393e67299faf88f87bf4",
+  "false_positives": 0,
+  "close_recall": 1.0,
+  "resume_recall": 1.0,
+  "failed_predecessor_sha256": "2d562daf6ad10098b04e74ce90926bfa5daa0a20c5eb01b743c8efdbb927267d",
+  "failed_predecessor_false_positives": 1,
+  "method": "tests/run_sealed_holdout.py verifies the private dataset digest and prints aggregate results only"
+}
