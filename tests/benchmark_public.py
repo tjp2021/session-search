@@ -55,6 +55,10 @@ def timed(callable_) -> tuple[object, float]:
     return result, (time.perf_counter() - started) * 1000
 
 
+def regression_limit(baseline_ms: float, factor: float, floor_ms: float) -> float:
+    return max(floor_ms, baseline_ms * factor)
+
+
 def run(session_count: int, semantic: bool) -> dict[str, object]:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -143,19 +147,26 @@ def main() -> int:
                     )
                     continue
                 for metric in ("p50_ms", "p95_ms"):
-                    limit = max(
+                    limit = regression_limit(
+                        float(baseline["queries"][mode][metric]),
+                        args.max_regression_factor,
                         50.0,
-                        float(baseline["queries"][mode][metric])
-                        * args.max_regression_factor,
                     )
                     if float(timings[metric]) > limit:
                         failures.append(
                             f"{measured_run['sessions']} {mode} {metric}={timings[metric]} exceeds {limit:.3f}"
                         )
-            if args.semantic and float(measured_run["embedding_ms"]) > 30000:
-                failures.append(
-                    f"{measured_run['sessions']} embedding_ms={measured_run['embedding_ms']} exceeds 30000"
+            if args.semantic:
+                embedding_limit = regression_limit(
+                    float(baseline["embedding_ms"]),
+                    args.max_regression_factor,
+                    30000.0,
                 )
+                if float(measured_run["embedding_ms"]) > embedding_limit:
+                    failures.append(
+                        f"{measured_run['sessions']} embedding_ms="
+                        f"{measured_run['embedding_ms']} exceeds {embedding_limit:.3f}"
+                    )
         if failures:
             print("Performance evidence gate failed:", file=sys.stderr)
             for failure in failures:

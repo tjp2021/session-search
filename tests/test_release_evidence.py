@@ -13,6 +13,13 @@ assert SPEC and SPEC.loader
 GATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GATE)
 
+BENCHMARK_SPEC = importlib.util.spec_from_file_location(
+    "benchmark_public", ROOT / "tests" / "benchmark_public.py"
+)
+assert BENCHMARK_SPEC and BENCHMARK_SPEC.loader
+BENCHMARK = importlib.util.module_from_spec(BENCHMARK_SPEC)
+BENCHMARK_SPEC.loader.exec_module(BENCHMARK)
+
 
 def passing_records() -> list[dict[str, object]]:
     return [
@@ -39,6 +46,14 @@ class HumanUsabilityGateTest(unittest.TestCase):
         failures = GATE.evaluate({"records": records})
         self.assertTrue(any("5 participants" in item for item in failures))
         self.assertTrue(any("unsafe" in item for item in failures))
+
+
+class PerformanceEvidenceGateTest(unittest.TestCase):
+    def test_embedding_limit_uses_the_regression_factor(self):
+        self.assertAlmostEqual(
+            BENCHMARK.regression_limit(6807.257, 6.0, 30000.0),
+            40843.542,
+        )
 
 
 if __name__ == "__main__":
