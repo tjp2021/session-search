@@ -37,18 +37,13 @@ class PortableConfigurationTest(unittest.TestCase):
         self.assertIn("starter cases", text)
         self.assertNotIn("/users/", text)
 
-    def test_readme_documents_the_unpinned_design_partner_install(self):
+    def test_readme_documents_the_published_install(self):
         root = pathlib.Path(__file__).resolve().parents[1]
         with (root / "pyproject.toml").open("rb") as handle:
             payload = tomllib.load(handle)
         readme = (root / "README.md").read_text(encoding="utf-8")
-        repository = payload["project"]["urls"]["Repository"]
-        install = (
-            f'pipx install "{payload["project"]["name"]}[semantic] '
-            f'@ git+{repository}.git"'
-        )
+        install = f'pipx install "{payload["project"]["name"]}[semantic]"'
         self.assertIn(install, readme)
-        self.assertIn("not version-pinned", readme)
         self.assertIn("ss capabilities", readme)
         self.assertIn("ss demo", readme)
 
