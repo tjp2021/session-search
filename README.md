@@ -42,19 +42,18 @@ you turn on two settings. See
 
 ## Install
 
-Session Search supports macOS, Linux, and Python 3.11 or newer. This design-partner
-command installs the latest public `main` branch from GitHub:
+Session Search supports macOS, Linux, and Python 3.11 or newer. Install the
+complete local search experience with:
 
 ```bash
-pipx install "session-search[semantic] @ git+https://github.com/tjp2021/session-search.git"
+pipx install "session-search[semantic]"
 ```
 
-This command is not version-pinned. The first semantic search can download the
-local model and take longer. Use the smaller base install when you want to
-start without that model:
+The first semantic search can download the local model and take longer. Use the
+smaller base install when you want to start without that model:
 
 ```bash
-pipx install "session-search @ git+https://github.com/tjp2021/session-search.git"
+pipx install session-search
 ```
 
 Without the `semantic` option, Session Search still supports exact-word and

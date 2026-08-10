@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "session-search"
 version = "0.2.2"
-description = "Recover lost work across Claude Code and Codex sessions"
+description = "Find and reopen local AI coding sessions from one terminal command"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -16,6 +16,7 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",

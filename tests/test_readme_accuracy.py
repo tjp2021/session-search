@@ -62,16 +62,10 @@ class ReadmeCommandTest(unittest.TestCase):
             unroutable, f"README documents commands that reach no handler: {sorted(unroutable)}"
         )
 
-    def test_pipx_install_uses_the_repository_url(self):
-        """The package is not published on PyPI, so a bare name cannot install."""
-        for line in command_lines():
-            if not line.startswith("pipx install"):
-                continue
-            self.assertIn(
-                "git+https",
-                line,
-                f"pipx line cannot work, session-search is not on PyPI: {line}",
-            )
+    def test_pipx_install_uses_the_published_package(self):
+        lines = {line for line in command_lines() if line.startswith("pipx install")}
+        self.assertIn('pipx install "session-search[semantic]"', lines)
+        self.assertIn("pipx install session-search", lines)
 
     def test_venv_commands_document_how_to_create_the_venv(self):
         """A fresh clone has no .venv, so every .venv command needs a setup step."""
